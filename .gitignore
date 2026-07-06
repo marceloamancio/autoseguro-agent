@@ -1,0 +1,33 @@
+# Segredos — NUNCA commitar (o avaliador usa a chave dele)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.uv/
+build/
+dist/
+
+# Testes / cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Logs de execução (podem conter PII/chave — só commitamos logs curados/mascarados)
+logs/
+*.log
+
+# SO / editor
+.DS_Store
+.idea/
+.vscode/
