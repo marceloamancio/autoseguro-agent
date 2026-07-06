@@ -59,6 +59,13 @@ def build_agent_from_config(
     import anthropic
 
     llm = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
+    if extractor is None:
+        # Adapter real de extração (tool-use estrito) — sem ele, a qualificação
+        # nunca captura os dados e todo lead acaba em handoff. Só no caminho de
+        # produção; os testes injetam um extractor mockado.
+        from .anthropic_extractor import AnthropicExtractor
+
+        extractor = AnthropicExtractor(config.anthropic_api_key, config.anthropic_model)
     quote_client = QuoteClient(config)
     session = QualificationSession()
     return Agent(
