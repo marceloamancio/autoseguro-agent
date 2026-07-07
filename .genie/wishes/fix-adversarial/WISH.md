@@ -1,6 +1,6 @@
 # Wish: Conserto dos furos adversariais (red-team)
 
-**Status:** IN_PROGRESS
+**Status:** SHIPPED
 **Slug:** `fix-adversarial`
 **Created:** 2026-07-07
 

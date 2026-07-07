@@ -56,7 +56,7 @@ Variáveis (ver `.env.example` e `autoseguro/config.py`):
 | `QUOTE_BACKOFF_BASE_S` | `0.5` | Base do backoff exponencial + jitter. |
 | `QUOTE_DEADLINE_S` | `30.0` | Deadline total sobre o conjunto de tentativas (coerente com retries×timeout). |
 | `QUOTE_CB_FAILURE_THRESHOLD` | `5` | Falhas de infra seguidas até o circuit breaker abrir. |
-| `QUOTE_CB_RESET_S` | `30.0` | Tempo aberto antes de sondar `/health` e tentar fechar. |
+| `QUOTE_CB_RESET_S` | `30.0` | Tempo aberto antes do canary (uma tentativa real ao `/quote`) tentar fechar. |
 
 ### 3. Rode a CLI de chat
 
