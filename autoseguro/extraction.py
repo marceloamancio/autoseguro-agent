@@ -37,6 +37,25 @@ DEFAULT_MAX_ATTEMPTS = 2
 
 _ESSENTIAL_FIELDS = ("idade", "veiculo_ano", "cep")
 
+# Intenções reconhecidas do turno (2.1 -- fundidas no EXTRACT_TOOL,
+# `anthropic_extractor.py`). "other" é o default neutro/seguro quando o
+# `llm_client` não devolve o campo (extração antiga) ou devolve um valor
+# fora do enum -- nunca deve derrubar a extração dos demais campos.
+_VALID_INTENTS = frozenset(
+    {
+        "confirm",
+        "correct",
+        "reject",
+        "requote",
+        "out_of_scope",
+        "complaint",
+        "explicit_human",
+        "provide_data",
+        "other",
+    }
+)
+_DEFAULT_INTENT = "other"
+
 # Pivô pra desambiguar ano de 2 dígitos: yy <= _PIVOT_2_DIGIT_ANO -> 20xx,
 # senão -> 19xx. Regra comum de calendário (ex.: "08" -> 2008, "97" -> 1997).
 _PIVOT_2_DIGIT_ANO = 68  # ano corrente % 100 seria mais "correto", mas um pivô
@@ -71,6 +90,7 @@ class ExtractedData:
     marca: str | None = None
     modelo: str | None = None
     data_inicio: str | None = None
+    intent: str = _DEFAULT_INTENT
 
     def essential_missing(self) -> list[str]:
         """Lista os campos essenciais (`idade`, `veiculo_ano`, `cep`) ausentes."""
@@ -149,6 +169,19 @@ def normalize_idade(raw: int | str | None) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def normalize_intent(raw: str | None) -> str:
+    """Normaliza a intenção do turno (2.1) para um valor do enum conhecido.
+
+    `None`, campo ausente (extração antiga) ou um valor fora do enum sempre
+    caem no default neutro `"other"` -- nunca derruba a extração dos demais
+    campos.
+    """
+    if raw is None:
+        return _DEFAULT_INTENT
+    value = str(raw).strip()
+    return value if value in _VALID_INTENTS else _DEFAULT_INTENT
 
 
 def backstop_extract(text: str) -> dict[str, Any]:
@@ -238,6 +271,7 @@ def extract_once(
         marca=raw.get("marca"),
         modelo=raw.get("modelo"),
         data_inicio=raw.get("data_inicio"),
+        intent=normalize_intent(raw.get("intent")),
     )
 
     return ExtractionResult(data=data, llm_used=llm_used, llm_raw=raw, warnings=warnings)

@@ -278,6 +278,52 @@ def test_qualification_session_acumula_dados_entre_turnos():
     assert session.is_complete() is True
 
 
+# ---------------------------------------------------------------------------
+# 2.1 — `intent` fundido na extração (zero chamada extra de LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_once_carrega_intent_do_llm():
+    llm = StubLlmClient({"idade": 40, "intent": "correct"})
+
+    result = extract_once("na verdade tenho 40 anos", llm_client=llm)
+
+    assert result.data.intent == "correct"
+
+
+def test_extract_once_default_intent_quando_llm_nao_devolve_o_campo():
+    # Extração antiga (sem `intent`) ou LLM que não retornou o campo -- nunca
+    # deve quebrar; cai num default neutro.
+    llm = StubLlmClient({"idade": 35})
+
+    result = extract_once("tenho 35 anos", llm_client=llm)
+
+    assert result.data.intent == "other"
+
+
+def test_extract_once_default_intent_sem_llm_client_nenhum():
+    result = extract_once("carro 2013, cep 30130-000", llm_client=None)
+
+    assert result.data.intent == "other"
+
+
+def test_extract_once_normaliza_intent_desconhecido_para_other():
+    llm = StubLlmClient({"intent": "algo_nao_mapeado"})
+
+    result = extract_once("oi", llm_client=llm)
+
+    assert result.data.intent == "other"
+
+
+def test_qualification_session_process_turn_expoe_intent_do_turno_atual():
+    session = QualificationSession(max_attempts=2)
+    llm = StubLlmClient({"idade": 40, "intent": "correct"})
+
+    result = session.process_turn("na verdade tenho 40 anos", llm_client=llm)
+
+    assert result.data.intent == "correct"
+
+
 def test_qualification_session_max_attempts_e_parametrizavel():
     session = QualificationSession(max_attempts=3)
 

@@ -15,6 +15,24 @@ from typing import Any
 # Tool de extração com schema estrito: o modelo é forçado a devolver exatamente
 # estes campos (null para o que não estiver na mensagem). É aqui que o Q2
 # ("structured outputs / strict:true") é de fato exercitado.
+#
+# `intent` (2.1, o conserto central do P1-2): a MESMA chamada que extrai os
+# dados de cotação também classifica a intenção do turno -- zero chamada
+# extra de LLM. O agente (`agent.py`/`handoff.py`) consome esse sinal pra
+# decidir escopo/confirmação/re-cotação; o LLM continua fora de
+# preço/resiliência/execução de handoff (só classifica, nunca decide).
+INTENTS = (
+    "confirm",
+    "correct",
+    "reject",
+    "requote",
+    "out_of_scope",
+    "complaint",
+    "explicit_human",
+    "provide_data",
+    "other",
+)
+
 EXTRACT_TOOL: dict[str, Any] = {
     "name": "registrar_dados_cotacao",
     "description": (
@@ -34,8 +52,24 @@ EXTRACT_TOOL: dict[str, Any] = {
                 "type": ["string", "null"],
                 "description": "Início da vigência em YYYY-MM-DD, se o lead mencionar",
             },
+            "intent": {
+                "type": "string",
+                "description": (
+                    "Intenção do turno: confirm (confirmou os dados sem "
+                    "corrigir nada), correct (corrigiu/alterou um dado antes "
+                    "informado), reject (negou os dados apresentados), "
+                    "requote (pede pra cotar de novo, já com cotação "
+                    "entregue), out_of_scope (assunto fora de venda de "
+                    "seguro de veículo, ex.: sinistro/boleto/cancelamento), "
+                    "complaint (reclamação/conflito/ameaça), explicit_human "
+                    "(pediu explicitamente falar com um humano/atendente), "
+                    "provide_data (só está informando dados de cotação), "
+                    "other (nenhuma das anteriores)."
+                ),
+                "enum": list(INTENTS),
+            },
         },
-        "required": ["veiculo_ano", "idade", "cep", "marca", "modelo", "data_inicio"],
+        "required": ["veiculo_ano", "idade", "cep", "marca", "modelo", "data_inicio", "intent"],
         "additionalProperties": False,
     },
 }
@@ -44,7 +78,8 @@ _SYSTEM = (
     "Você extrai dados para cotação de seguro auto de mensagens em português "
     "informal e bagunçado. Chame a tool registrar_dados_cotacao com os campos "
     "que conseguir inferir da mensagem do lead; use null para o que não estiver "
-    "presente. Nunca invente dados que o lead não informou."
+    "presente. Nunca invente dados que o lead não informou. Classifique também "
+    "a intenção do turno no campo intent."
 )
 
 

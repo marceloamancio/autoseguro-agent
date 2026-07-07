@@ -66,3 +66,49 @@ def test_extract_sem_tool_use_devolve_vazio():
     extractor = AnthropicExtractor("sk-ant-fake", "m", client=_FakeClient(resp))
 
     assert extractor.extract("qualquer coisa") == {}
+
+
+# ---------------------------------------------------------------------------
+# 2.1 — `intent` fundido no EXTRACT_TOOL (zero chamada extra de LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_tool_schema_inclui_intent_com_enum_e_continua_estrito():
+    from autoseguro.anthropic_extractor import EXTRACT_TOOL
+
+    props = EXTRACT_TOOL["input_schema"]["properties"]
+    assert "intent" in props
+    assert set(props["intent"]["enum"]) == {
+        "confirm",
+        "correct",
+        "reject",
+        "requote",
+        "out_of_scope",
+        "complaint",
+        "explicit_human",
+        "provide_data",
+        "other",
+    }
+    assert "intent" in EXTRACT_TOOL["input_schema"]["required"]
+    assert EXTRACT_TOOL["strict"] is True
+    assert EXTRACT_TOOL["input_schema"]["additionalProperties"] is False
+
+
+def test_extract_devolve_intent_junto_dos_demais_campos():
+    payload = {
+        "veiculo_ano": 2008,
+        "idade": 35,
+        "cep": "01310-100",
+        "marca": "Toyota",
+        "modelo": "Corolla",
+        "data_inicio": None,
+        "intent": "provide_data",
+    }
+    client = _FakeClient(_tool_use_response(payload))
+    extractor = AnthropicExtractor("sk-ant-fake", "claude-sonnet-5", client=client)
+
+    out = extractor.extract("Corolla 2008, tenho 35 anos, CEP 01310-100")
+
+    assert out["intent"] == "provide_data"
+    # Uma única chamada ao LLM -- intent fundido na mesma extração.
+    assert len(client.messages.calls) == 1
