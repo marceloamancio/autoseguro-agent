@@ -24,6 +24,7 @@ de execução completa" (ids + status por mensagem/cotação).
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from typing import Any, Callable
 
@@ -42,6 +43,40 @@ EXIT_WORDS: tuple[str, ...] = ("sair", "exit", "quit")
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
+
+# 2.3 (P1-3): marcador líder de mídia -- `[documento]/[imagem]/[audio]/
+# [foto]/[video] <arquivo>`. O dataset do desafio só traz o marcador (sem
+# transcrição), então a CLI precisa mapear pro `media_type` que
+# `handoff.is_media_essential`/`for_media_unreadable` já sabem tratar --
+# antes disso, o marcador era lido como texto de qualificação comum.
+_MEDIA_MARKER_RE = re.compile(
+    r"^\[(documento|imagem|audio|áudio|foto|video|vídeo)\]\s*(.*)$", re.IGNORECASE
+)
+_MEDIA_MARKER_TO_TYPE: dict[str, str] = {
+    "documento": "document",
+    "imagem": "image",
+    "foto": "image",
+    "audio": "audio",
+    "áudio": "audio",
+    "video": "video",
+    "vídeo": "video",
+}
+
+
+def parse_media_marker(user_msg: str) -> tuple[str, str | None]:
+    """Detecta o marcador líder de mídia e devolve `(texto, media_type)`.
+
+    Sem marcador, devolve o texto original e `media_type=None` (mensagem de
+    texto comum). Reusa `handoff.is_media_essential` pra decidir se o
+    `media_type` resultante é essencial (imagem/áudio/documento) -- este
+    parser só normaliza o marcador, nunca decide handoff sozinho.
+    """
+    match = _MEDIA_MARKER_RE.match(user_msg.strip())
+    if not match:
+        return user_msg, None
+    marker, rest = match.groups()
+    media_type = _MEDIA_MARKER_TO_TYPE.get(marker.lower())
+    return rest.strip(), media_type
 
 
 def build_agent_from_config(
@@ -90,6 +125,7 @@ async def _run_turn_with_ack_and_nudge(
     *,
     nudge_after_s: float,
     output_fn: OutputFn,
+    media_type: str | None = None,
 ) -> Any:
     """Roda `agent.handle_turn`, emitindo ack imediato e nudges se demorar.
 
@@ -102,7 +138,7 @@ async def _run_turn_with_ack_and_nudge(
     if agent.state.awaiting_confirmation:
         output_fn(ACK_MESSAGE)
 
-    task = asyncio.ensure_future(agent.handle_turn(user_msg))
+    task = asyncio.ensure_future(agent.handle_turn(user_msg, media_type=media_type))
     while True:
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=nudge_after_s)
@@ -165,8 +201,14 @@ async def run_repl(
 
         tracer.message_in(user_msg)
 
+        text, media_type = parse_media_marker(user_msg)
+
         turn = await _run_turn_with_ack_and_nudge(
-            agent, user_msg, nudge_after_s=nudge_after_s, output_fn=output_fn
+            agent,
+            text,
+            nudge_after_s=nudge_after_s,
+            output_fn=output_fn,
+            media_type=media_type,
         )
 
         tracer.message_out(turn.reply)

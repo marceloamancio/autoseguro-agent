@@ -22,6 +22,7 @@ import pytest
 from autoseguro import cli
 from autoseguro.agent import Agent
 from autoseguro.extraction import QualificationSession
+from autoseguro.handoff import HandoffReason
 from autoseguro.quote_client import QuoteResult
 from autoseguro.tracing import Tracer
 
@@ -219,6 +220,72 @@ async def test_run_repl_logs_handoff_with_reason_code_when_quote_unavailable(tmp
 
     decision_events = [e for e in events if e["type"] == "decision"]
     assert any(e["status"] == "handoff" for e in decision_events)
+
+
+# ---------------------------------------------------------------------------
+# 2.3 (P1-3) — CLI parseia o marcador líder de mídia e passa `media_type`
+# pro `Agent.handle_turn` (antes, código morto: `MEDIA_UNREADABLE` nunca
+# disparava na entrega real).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cli_media_marker_triggers_media_unreadable(tmp_path):
+    quote_client = StubQuoteClient(result=make_quote())
+    extractor = StubExtractor({})
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    tracer = Tracer(path=tmp_path / "trace.jsonl")
+
+    input_fn = _make_input_fn(["[documento] CNH_frente.pdf", "sair"])
+    outputs: list[str] = []
+
+    await cli.run_repl(agent, tracer, input_fn=input_fn, output_fn=outputs.append)
+    tracer.close()
+
+    assert agent.state.handoff is not None
+    assert agent.state.handoff.reason == HandoffReason.MEDIA_UNREADABLE
+    assert quote_client.calls == []  # nunca tratou o marcador como texto de qualificação
+
+
+@pytest.mark.asyncio
+async def test_cli_regular_text_still_qualifies_normally(tmp_path):
+    quote = make_quote()
+    quote_client = StubQuoteClient(result=quote)
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2008, "cep": "26703-384"})
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    tracer = Tracer(path=tmp_path / "trace.jsonl")
+
+    input_fn = _make_input_fn(
+        ["Tenho um Corolla 2008, 35 anos, CEP 26703-384", "sim, confirmo", "sair"]
+    )
+    outputs: list[str] = []
+
+    await cli.run_repl(agent, tracer, input_fn=input_fn, output_fn=outputs.append)
+    tracer.close()
+
+    assert agent.state.handoff is None
+    assert len(quote_client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "raw, expected_text, expected_media_type",
+    [
+        ("[documento] CNH_frente.pdf", "CNH_frente.pdf", "document"),
+        ("[imagem] foto.png", "foto.png", "image"),
+        ("[foto] carro.jpg", "carro.jpg", "image"),
+        ("[audio] mensagem.ogg", "mensagem.ogg", "audio"),
+        ("Tenho 35 anos", "Tenho 35 anos", None),
+    ],
+)
+def test_parse_media_marker(raw, expected_text, expected_media_type):
+    text, media_type = cli.parse_media_marker(raw)
+
+    assert text == expected_text
+    assert media_type == expected_media_type
 
 
 # ---------------------------------------------------------------------------

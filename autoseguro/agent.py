@@ -180,6 +180,10 @@ class AgentState:
     quote_delivered: bool = False
     handoff: HandoffDecision | None = None
     asked_data_inicio: bool = False
+    # 1.2 (P0-1): último payload que a /quote recusou com 400 -- nunca
+    # reenviado idêntico (ver `_quote_and_reply`).
+    last_invalid_payload: dict[str, Any] | None = None
+    last_invalid_detalhe: str | None = None
 
 
 @dataclass
@@ -279,10 +283,31 @@ def format_refusal(exc: CotacaoRecusada) -> str:
 
 
 def format_payload_invalido(exc: PayloadInvalido) -> str:
-    """Pede o dado faltante/errado apontado pela API (400) — sem handoff."""
+    """Pede o dado faltante/errado apontado pela API (400) — sem handoff.
+
+    Menciona `data_inicio` como possível causa (1.2 / P0-1) -- a data é um
+    campo tão sujeito a erro de formato quanto idade/ano/CEP, mas antes não
+    era citada aqui, então o lead nunca sabia que precisava corrigi-la.
+    """
     return (
         f"Preciso ajustar um dado antes de cotar: {exc.detalhe} Pode "
-        "confirmar de novo sua idade, o ano do veículo e o CEP?"
+        "confirmar de novo sua idade, o ano do veículo, o CEP e a data de "
+        "início (se informou uma, no formato dd/mm/aaaa)?"
+    )
+
+
+def format_payload_invalido_repetido(detalhe: str | None) -> str:
+    """Payload já recusado (400) chegou idêntico de novo (1.2 / P0-1).
+
+    Nunca reenvia o mesmo payload pra `/quote` -- pede especificamente o
+    campo mais provável de estar malformado (`data_inicio`) em vez de repetir
+    a mesma pergunta genérica, que travaria a conversa em loop.
+    """
+    return (
+        "Ainda não consegui fechar a cotação com os dados que você "
+        f"confirmou (motivo: {detalhe or 'dado inválido'}). Pra eu não ficar "
+        "tentando de novo do mesmo jeito: pode me confirmar especificamente "
+        "a data de início que você quer, no formato dd/mm/aaaa?"
     )
 
 
@@ -374,6 +399,14 @@ class Agent:
         result = state.session.process_turn(user_msg, llm_client=self._extractor)
         intent = result.data.intent
         essential_changed = _essential_snapshot(state.session.data) != before_essential
+
+        if result.contradiction:
+            # 2.2 (P1-4): sobrescrita materialmente diferente de um
+            # essencial (ex.: idade 35 -> 90) -- autoridade, não capacidade;
+            # nunca resolvido sozinho (`QualificationSession.process_turn`).
+            decision = handoff.for_contradictory_data(user_msg)
+            state.handoff = decision
+            return AgentTurn(reply=decision.message, handoff=decision)
 
         decision = handoff.for_policy_issuance(user_msg) or handoff.classify_scope(
             intent, user_msg, self._fuzzy_classifier
@@ -491,6 +524,15 @@ class Agent:
             "data_inicio": data_inicio,
         }
 
+        # 1.2 (P0-1): este EXATO payload já levou 400 antes -- nunca reenvia
+        # igual esperando um resultado diferente (é assim que o loop
+        # infinito acontecia). Pede o campo ofensor em vez de martelar a API.
+        if state.last_invalid_payload == payload:
+            state.awaiting_confirmation = True
+            return AgentTurn(
+                reply=format_payload_invalido_repetido(state.last_invalid_detalhe)
+            )
+
         try:
             quote = await self.call_quote(payload)
         except CotacaoRecusada as exc:
@@ -498,6 +540,8 @@ class Agent:
             return AgentTurn(reply=format_refusal(exc), closed=True)
         except PayloadInvalido as exc:
             state.awaiting_confirmation = True
+            state.last_invalid_payload = payload
+            state.last_invalid_detalhe = exc.detalhe
             return AgentTurn(reply=format_payload_invalido(exc))
         except QuoteUnavailable as exc:
             decision = handoff.for_quote_unavailable(exc)
@@ -509,6 +553,8 @@ class Agent:
             return AgentTurn(reply=decision.message, handoff=decision)
 
         state.quote_delivered = True
+        state.last_invalid_payload = None
+        state.last_invalid_detalhe = None
         explanation = format_quote_explanation(quote, fallback_note=fallback_note)
         return AgentTurn(reply=explanation, quote=quote)
 

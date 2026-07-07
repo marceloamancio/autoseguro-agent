@@ -28,6 +28,7 @@ from autoseguro.extraction import (
     extract_once,
     normalize_ano,
     normalize_cep,
+    normalize_data_inicio,
     normalize_idade,
 )
 
@@ -336,3 +337,129 @@ def test_qualification_session_max_attempts_e_parametrizavel():
 
     assert session.attempts == 3
     assert session.needs_handoff() is True
+
+
+# ---------------------------------------------------------------------------
+# 1.2 (P0-1) — `normalize_data_inicio`: ISO ou dd/mm/aaaa válidos -> ISO;
+# datas malformadas/inexistentes -> None (nunca propaga pro payload da /quote).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("2026-03-15", "2026-03-15"),
+        ("15/03/2026", "2026-03-15"),
+        ("01/01/2026", "2026-01-01"),
+    ],
+)
+def test_normalize_data_inicio_aceita_iso_e_dd_mm_aaaa(raw, expected):
+    assert normalize_data_inicio(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "30/02/2026",  # fevereiro não tem dia 30
+        "amanhã",
+        "31/04/2026",  # abril não tem dia 31
+        "2026-02-30",
+        "",
+        None,
+        "não sei",
+    ],
+)
+def test_normalize_data_inicio_invalida_vira_none(raw):
+    assert normalize_data_inicio(raw) is None
+
+
+def test_extract_once_normaliza_data_inicio_invalida_para_none():
+    llm = StubLlmClient(
+        {"idade": 35, "veiculo_ano": 2015, "cep": "01000-000", "data_inicio": "30/02/2026"}
+    )
+
+    result = extract_once("35 anos, carro 2015, cep 01000-000, começa 30/02/2026", llm_client=llm)
+
+    assert result.data.data_inicio is None
+
+
+def test_extract_once_normaliza_data_inicio_dd_mm_aaaa_para_iso():
+    llm = StubLlmClient(
+        {"idade": 35, "veiculo_ano": 2015, "cep": "01000-000", "data_inicio": "15/03/2026"}
+    )
+
+    result = extract_once("35 anos, carro 2015, cep 01000-000, começa 15/03/2026", llm_client=llm)
+
+    assert result.data.data_inicio == "2026-03-15"
+
+
+# ---------------------------------------------------------------------------
+# 2.2 (P1-4) — contradição material entre turnos: idade Δ>15, veiculo_ano
+# Δ>10, CEP com prefixo (2 díg) diferente. Correção pequena/plausível NÃO é
+# contradição (guarda contra falso-positivo, coordena com 1.1).
+# ---------------------------------------------------------------------------
+
+
+def test_process_turn_flags_wild_age_contradiction():
+    session = QualificationSession()
+    session.process_turn("tenho 35 anos", llm_client=StubLlmClient({"idade": 35}))
+
+    result = session.process_turn(
+        "na verdade tenho 90 anos", llm_client=StubLlmClient({"idade": 90})
+    )
+
+    assert result.contradiction is True
+
+
+def test_process_turn_does_not_flag_small_age_correction():
+    session = QualificationSession()
+    session.process_turn("tenho 35 anos", llm_client=StubLlmClient({"idade": 35}))
+
+    result = session.process_turn(
+        "na verdade tenho 40 anos", llm_client=StubLlmClient({"idade": 40})
+    )
+
+    assert result.contradiction is False
+
+
+def test_process_turn_flags_wild_veiculo_ano_contradiction():
+    session = QualificationSession()
+    session.process_turn("carro 2015", llm_client=StubLlmClient({"veiculo_ano": 2015}))
+
+    result = session.process_turn(
+        "na verdade é de 1960", llm_client=StubLlmClient({"veiculo_ano": 1960})
+    )
+
+    assert result.contradiction is True
+
+
+def test_process_turn_does_not_flag_small_veiculo_ano_correction():
+    session = QualificationSession()
+    session.process_turn("carro 2015", llm_client=StubLlmClient({"veiculo_ano": 2015}))
+
+    result = session.process_turn(
+        "na verdade é 2009", llm_client=StubLlmClient({"veiculo_ano": 2009})
+    )
+
+    assert result.contradiction is False
+
+
+def test_process_turn_flags_cep_prefix_contradiction():
+    session = QualificationSession()
+    session.process_turn("cep 26703-384", llm_client=StubLlmClient({"cep": "26703-384"}))
+
+    result = session.process_turn(
+        "na verdade é 01000-000", llm_client=StubLlmClient({"cep": "01000-000"})
+    )
+
+    assert result.contradiction is True
+
+
+def test_process_turn_no_contradiction_on_first_turn():
+    session = QualificationSession()
+
+    result = session.process_turn(
+        "tenho 90 anos", llm_client=StubLlmClient({"idade": 90})
+    )
+
+    assert result.contradiction is False

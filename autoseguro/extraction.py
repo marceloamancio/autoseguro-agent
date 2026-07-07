@@ -66,6 +66,13 @@ _REGEX_CEP_COM_HIFEN = re.compile(r"\b\d{5}-\d{3}\b")
 _REGEX_CEP_8_DIGITOS = re.compile(r"\b\d{8}\b")
 _REGEX_NASCI_EM = re.compile(r"nasci\w*\s+em\s+(\d{4})", re.IGNORECASE)
 _REGEX_DIGITS_ONLY = re.compile(r"\D+")
+_REGEX_DATA_BR = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+
+# 2.2 (P1-4): limiares conservadores pra distinguir correção pequena/plausível
+# (nunca contradição) de dado materialmente diferente (contradição) --
+# coordena com 1.1 (35 -> 40 é correção; 35 -> 90 é contradição).
+_IDADE_CONTRADICTION_DELTA = 15
+_VEICULO_ANO_CONTRADICTION_DELTA = 10
 
 
 class LlmExtractorClient(Protocol):
@@ -109,6 +116,10 @@ class ExtractionResult:
     llm_used: bool
     llm_raw: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # 2.2 (P1-4): só é preenchido por `QualificationSession.process_turn`
+    # (compara contra o dado essencial já acumulado na sessão) -- sempre
+    # `False` num `extract_once` isolado, que não tem histórico pra comparar.
+    contradiction: bool = False
 
 
 def normalize_ano(raw: int | str | None) -> int | None:
@@ -184,6 +195,36 @@ def normalize_intent(raw: str | None) -> str:
     return value if value in _VALID_INTENTS else _DEFAULT_INTENT
 
 
+def normalize_data_inicio(raw: str | None) -> str | None:
+    """Normaliza `data_inicio` para ISO `YYYY-MM-DD` (1.2 / P0-1).
+
+    Aceita ISO (`YYYY-MM-DD`) e `dd/mm/aaaa`; qualquer outra coisa -- data
+    inexistente ("30/02/2026"), texto livre ("amanhã") ou vazio -- vira
+    `None`. **Nunca** deixa uma data malformada chegar ao payload da
+    `/quote` (que só aceita `date.fromisoformat`): o caller (`agent.py`) usa
+    o fallback de "hoje" quando este normalizador devolve `None`.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        pass
+
+    match = _REGEX_DATA_BR.fullmatch(text)
+    if not match:
+        return None
+    dd, mm, yyyy = match.groups()
+    try:
+        return date(int(yyyy), int(mm), int(dd)).isoformat()
+    except ValueError:
+        return None
+
+
 def backstop_extract(text: str) -> dict[str, Any]:
     """Rede de segurança via regex leve: ano (19xx/20xx) e CEP direto do texto.
 
@@ -204,6 +245,25 @@ def backstop_extract(text: str) -> dict[str, Any]:
             result["cep"] = normalized
 
     return result
+
+
+def _is_contradictory(field_name: str, old_value: Any, new_value: Any) -> bool:
+    """Sobrescrita materialmente diferente de um essencial (2.2 / P1-4).
+
+    Conservador de propósito: `None` (primeiro turno) ou valor igual nunca é
+    contradição -- só correções grosseiras dos 3 essenciais: `idade`
+    Δ>15, `veiculo_ano` Δ>10, `cep` com prefixo (2 díg) diferente. Correção
+    pequena/plausível (ex.: 35 -> 40) não passa desses limiares.
+    """
+    if old_value is None or new_value is None or old_value == new_value:
+        return False
+    if field_name == "idade":
+        return abs(new_value - old_value) > _IDADE_CONTRADICTION_DELTA
+    if field_name == "veiculo_ano":
+        return abs(new_value - old_value) > _VEICULO_ANO_CONTRADICTION_DELTA
+    if field_name == "cep":
+        return str(old_value)[:2] != str(new_value)[:2]
+    return False
 
 
 def _validate_range(value: int | None, low: int, high: int) -> int | None:
@@ -270,7 +330,7 @@ def extract_once(
         cep=cep,
         marca=raw.get("marca"),
         modelo=raw.get("modelo"),
-        data_inicio=raw.get("data_inicio"),
+        data_inicio=normalize_data_inicio(raw.get("data_inicio")),
         intent=normalize_intent(raw.get("intent")),
     )
 
@@ -305,12 +365,18 @@ class QualificationSession:
         self.attempts += 1
         result = extract_once(text, llm_client=llm_client)
 
+        contradiction = False
         for f in ("veiculo_ano", "idade", "cep", "marca", "modelo", "data_inicio"):
             new_value = getattr(result.data, f)
             if new_value is not None:
+                if f in _ESSENTIAL_FIELDS and _is_contradictory(
+                    f, getattr(self.data, f), new_value
+                ):
+                    contradiction = True
                 setattr(self.data, f, new_value)
 
         self.warnings.extend(result.warnings)
+        result.contradiction = contradiction
         return result
 
     def missing_essential(self) -> list[str]:
