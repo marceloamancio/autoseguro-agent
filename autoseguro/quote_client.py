@@ -151,7 +151,11 @@ class QuoteClient:
         self._breaker = _CircuitBreaker(
             config.quote_cb_failure_threshold, config.quote_cb_reset_s
         )
-        self._client = httpx.AsyncClient(base_url=config.quote_api_url, transport=transport)
+        self._client = httpx.AsyncClient(
+            base_url=config.quote_api_url,
+            transport=transport,
+            timeout=httpx.Timeout(config.quote_timeout_s),
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()
