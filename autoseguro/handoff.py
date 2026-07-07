@@ -224,6 +224,7 @@ def for_clarify_loop_exhausted(session: "QualificationSession") -> HandoffDecisi
         ),
         context={
             "attempts": session.attempts,
+            "stalled_turns": session.stalled_turns,
             "missing": session.missing_essential(),
             "data": vars(session.data),
         },
@@ -331,6 +332,34 @@ _INTENT_TO_FUZZY_BUILDER = {
 }
 
 
+_IN_SCOPE_TOPIC_RE = re.compile(
+    r"franquia|coberturas?|car[êe]ncia|ap[óo]lice|sinistro|pr[êe]mio"
+    r"|mensalidade|parcela|pr[óo]-rata|plano|seguro|vig[êe]ncia",
+    re.IGNORECASE,
+)
+
+
+def is_in_scope_topic(text: str) -> bool:
+    """Definição POSITIVA de escopo (Bug L2): tópicos do seguro auto que
+    acabou de ser cotado (franquia, cobertura, carência, apólice, sinistro,
+    prêmio, mensalidade, parcela, pró-rata, plano, seguro, vigência) nunca
+    são fora de escopo, mesmo que o classificador de intenção (LLM) tenha
+    devolvido `out_of_scope` pro turno.
+
+    Conservador de propósito: uma frase que já bate um gatilho **conhecido e
+    específico** de fora-de-escopo (`KeywordFuzzyClassifier` -- ex.: "seguro
+    residencial", "cancelar apólice", "sinistro" no sentido de abrir um
+    sinistro) nunca é considerada in-scope só por conter uma palavra genérica
+    como "seguro"/"apólice" -- esse override serve pra perguntas legítimas
+    sobre o seguro recém-cotado, não pra afrouxar os gatilhos de
+    fora-de-escopo já existentes.
+    """
+    low = text.lower()
+    if KeywordFuzzyClassifier().classify(low) is not None:
+        return False
+    return bool(_IN_SCOPE_TOPIC_RE.search(low))
+
+
 def classify_scope(
     intent: str | None,
     text: str,
@@ -339,7 +368,10 @@ def classify_scope(
     """Decide escopo/handoff a partir do sinal de intenção (2.1, P1-2).
 
     Ordem: primeiro o sinal de `intent` (vem fundido na mesma chamada de
-    extração — sem custo extra de LLM); só cai no stopgap
+    extração — sem custo extra de LLM); um `intent="out_of_scope"` sobre um
+    tópico legítimo do seguro recém-cotado (`is_in_scope_topic`, Bug L2) é
+    descartado antes de virar handoff -- "e a franquia, como funciona?" é
+    parte do próprio seguro, não algo alheio. Só cai no stopgap
     (`for_explicit_request` + `classify_fuzzy`/`KeywordFuzzyClassifier`)
     quando `intent` não ajuda (`None`/`"other"`/`"provide_data"`/etc. -- ex.:
     extractor não plugado, ou o LLM não viu sinal de escopo no turno).
@@ -350,6 +382,8 @@ def classify_scope(
     """
     if intent == "explicit_human":
         return _build_explicit_request_decision(text)
+    if intent == "out_of_scope" and is_in_scope_topic(text):
+        return None
     builder = _INTENT_TO_FUZZY_BUILDER.get(intent or "")
     if builder is not None:
         return builder(text)

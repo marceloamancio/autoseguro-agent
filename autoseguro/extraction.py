@@ -410,14 +410,20 @@ def extract_once(
 class QualificationSession:
     """Acumula dados extraídos ao longo de vários turnos de conversa.
 
-    Cada `process_turn` conta como uma tentativa de qualificação. Quando o
-    número de tentativas atinge `max_attempts` (default `N=2`, DEC-5) e ainda
-    falta dado essencial, `needs_handoff()` sinaliza que o agente deve
+    `attempts` conta **todo** turno processado (telemetria). O que decide
+    handoff é `stalled_turns`: turnos **consecutivos sem progresso** (nenhum
+    essencial novo -- `idade`/`veiculo_ano`/`cep` -- capturado). Um lead
+    cooperativo que dá 1 dado essencial por turno nunca estoura, mesmo que
+    leve mais turnos que `max_attempts` pra terminar (bug L1: contar
+    tentativas totais penalizava progresso lento, não falta de cooperação).
+    Quando `stalled_turns` atinge `max_attempts` (default `N=2`, DEC-5) e
+    ainda falta dado essencial, `needs_handoff()` sinaliza que o agente deve
     transbordar em vez de insistir indefinidamente (ver Group E / handoff).
     """
 
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     attempts: int = 0
+    stalled_turns: int = 0
     data: ExtractedData = field(default_factory=ExtractedData)
     warnings: list[str] = field(default_factory=list)
 
@@ -430,8 +436,13 @@ class QualificationSession:
 
         Campos já conhecidos de turnos anteriores são preservados quando o
         turno atual não traz um valor novo (não-`None`) para eles.
+
+        Progresso (novo essencial capturado neste turno) zera
+        `stalled_turns`; sem progresso, incrementa -- é esse contador de
+        estagnação (não `attempts`) que alimenta `needs_handoff()`.
         """
         self.attempts += 1
+        before_missing = set(self.data.essential_missing())
         result = extract_once(text, llm_client=llm_client)
 
         contradiction = False
@@ -443,6 +454,12 @@ class QualificationSession:
                 ):
                     contradiction = True
                 setattr(self.data, f, new_value)
+
+        after_missing = set(self.data.essential_missing())
+        if before_missing - after_missing:
+            self.stalled_turns = 0
+        else:
+            self.stalled_turns += 1
 
         self.warnings.extend(result.warnings)
         result.contradiction = contradiction
@@ -457,5 +474,6 @@ class QualificationSession:
         return self.data.has_essential()
 
     def needs_handoff(self) -> bool:
-        """True quando o limite de tentativas foi atingido sem dado essencial."""
-        return self.attempts >= self.max_attempts and not self.is_complete()
+        """True quando `stalled_turns` consecutivos sem progresso atingiu o
+        limite e ainda falta dado essencial."""
+        return self.stalled_turns >= self.max_attempts and not self.is_complete()

@@ -159,6 +159,7 @@ def test_pedido_real_de_gerente_ou_supervisor_ainda_dispara_explicit_request(tex
 def test_clarify_loop_exhausted_after_max_attempts_without_essential_data():
     session = QualificationSession(max_attempts=2)
     session.attempts = 2
+    session.stalled_turns = 2
     session.data = ExtractedData(idade=None, veiculo_ano=2010, cep=None)
 
     decision = for_clarify_loop_exhausted(session)
@@ -307,3 +308,32 @@ def test_classify_scope_cai_no_stopgap_quando_intent_nao_ajuda():
     assert decision.reason == HandoffReason.EXPLICIT_REQUEST
 
     assert classify_scope("other", "sou gerente de vendas, quero cotar", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Bug L2 (regressão) — pergunta legítima sobre o seguro recém-cotado
+# (franquia, cobertura, carência etc.) não pode virar out_of_scope só porque
+# o LLM classificou `intent=out_of_scope`; genuinamente alheio ainda vaza.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_scope_pergunta_sobre_franquia_pos_cotacao_nao_transborda():
+    decision = classify_scope(
+        "out_of_scope", "e a franquia, como funciona?", None
+    )
+
+    assert decision is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "quero financiar uma casa",
+        "qual a previsão do tempo?",
+    ],
+)
+def test_classify_scope_assunto_genuinamente_alheio_ainda_transborda(text):
+    decision = classify_scope("out_of_scope", text, None)
+
+    assert decision is not None
+    assert decision.reason == HandoffReason.OUT_OF_SCOPE

@@ -403,6 +403,91 @@ def test_qualification_session_max_attempts_e_parametrizavel():
 
 
 # ---------------------------------------------------------------------------
+# Bug L1 (regressão) — clarify-loop não pode transbordar um lead cooperativo
+# que dá os dados essenciais aos poucos (1 por turno): só conta como
+# "tentativa" pra fins de handoff um turno SEM progresso (nenhum essencial
+# novo capturado). `attempts` continua contando todo turno (telemetria);
+# `needs_handoff()` passa a se basear em turnos consecutivos sem progresso.
+# ---------------------------------------------------------------------------
+
+
+class SequencedLlmClient:
+    """Dublê que devolve uma resposta diferente a cada chamada -- simula o
+    lead dando um dado essencial por turno, em vez de tudo de uma vez."""
+
+    def __init__(self, responses: list[dict]):
+        self._responses = responses
+        self._idx = 0
+        self.calls: list[str] = []
+
+    def extract(self, text: str) -> dict:
+        self.calls.append(text)
+        r = self._responses[min(self._idx, len(self._responses) - 1)]
+        self._idx += 1
+        return r
+
+
+def test_lead_cooperativo_dando_1_essencial_por_turno_nunca_transborda():
+    llm = SequencedLlmClient(
+        [
+            {"idade": 42},
+            {"veiculo_ano": 2015},
+            {"cep": "26703-384"},
+        ]
+    )
+    session = QualificationSession(max_attempts=2)
+
+    session.process_turn("tenho 42 anos", llm_client=llm)
+    assert session.needs_handoff() is False
+
+    session.process_turn("meu carro é 2015", llm_client=llm)
+    assert session.needs_handoff() is False
+
+    session.process_turn("cep 26703-384", llm_client=llm)
+    assert session.is_complete() is True
+    assert session.needs_handoff() is False
+
+
+def test_lead_sem_progresso_por_2_turnos_consecutivos_ainda_transborda():
+    # Comportamento preservado (Q6): quem realmente não coopera ainda deve
+    # disparar handoff após N=2 tentativas consecutivas sem nenhum progresso.
+    session = QualificationSession(max_attempts=2)
+
+    session.process_turn("oi, quero um seguro", llm_client=None)
+    assert session.needs_handoff() is False
+
+    session.process_turn("nao sei bem os dados", llm_client=None)
+
+    assert session.needs_handoff() is True
+    assert session.is_complete() is False
+
+
+def test_progresso_intercalado_com_estagnacao_zera_o_contador():
+    # 1 essencial, depois 1 turno sem nada (não deveria bastar sozinho pra
+    # transbordar, pois o contador de estagnação foi resetado no turno
+    # anterior), depois outro essencial -- nunca deve transbordar.
+    llm = SequencedLlmClient(
+        [
+            {"idade": 42},
+            {},
+            {"veiculo_ano": 2015},
+            {"cep": "26703-384"},
+        ]
+    )
+    session = QualificationSession(max_attempts=2)
+
+    session.process_turn("tenho 42 anos", llm_client=llm)
+    session.process_turn("hmm deixa eu ver", llm_client=llm)
+    assert session.needs_handoff() is False
+
+    session.process_turn("meu carro é 2015", llm_client=llm)
+    session.process_turn("cep 26703-384", llm_client=llm)
+
+    assert session.is_complete() is True
+    assert session.needs_handoff() is False
+
+
+# ---------------------------------------------------------------------------
 # 1.2 (P0-1) — `normalize_data_inicio`: ISO ou dd/mm/aaaa válidos -> ISO;
 # datas malformadas/inexistentes -> None (nunca propaga pro payload da /quote).
 # ---------------------------------------------------------------------------

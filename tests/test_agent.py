@@ -525,6 +525,39 @@ async def test_real_explicit_human_request_still_triggers_handoff():
 
 
 # ---------------------------------------------------------------------------
+# Bug L2 (regressão) — pergunta pós-cotação sobre franquia/cobertura/carência
+# é parte do próprio seguro (in-scope), mesmo que o LLM classifique o turno
+# como `out_of_scope`; assunto genuinamente alheio ainda transborda.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_quote_question_about_franquia_does_not_handoff():
+    quote = make_quote()
+    quote_client = StubQuoteClient(result=quote)
+    extractor = StubExtractor(
+        responses=[
+            {"idade": 35, "veiculo_ano": 2008, "cep": "26703-384"},
+            {},  # "sim, confirmo"
+            {"intent": "out_of_scope"},  # LLM classificou errado o turno seguinte
+        ]
+    )
+    llm = StubLlm(text="A franquia do seu plano é R$ 3.500.")
+    session = QualificationSession()
+    agent = Agent(
+        llm, quote_client, session,
+        extractor=extractor, fuzzy_classifier=KeywordFuzzyClassifier(),
+    )
+
+    await agent.handle_turn("Corolla 2008, 35 anos, CEP 26703-384")
+    await agent.handle_turn("sim, confirmo")
+    turn = await agent.handle_turn("e a franquia, como funciona?")
+
+    assert turn.handoff is None
+    assert turn.reply == "A franquia do seu plano é R$ 3.500."
+
+
+# ---------------------------------------------------------------------------
 # P1-5 — marca/modelo sanitizados antes de ecoar na confirmação (nunca cru).
 # ---------------------------------------------------------------------------
 
