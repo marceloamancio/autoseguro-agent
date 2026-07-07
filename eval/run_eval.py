@@ -159,7 +159,7 @@ def _extract_batch(groups, client, model, usage) -> dict[str, ConvResult]:
         order[conv] = len(texts)
         for i, text in enumerate(texts):
             requests.append(Request(
-                custom_id=f"{conv}#{i}",
+                custom_id=f"{conv}-{i}",
                 params=MessageCreateParamsNonStreaming(
                     model=model, max_tokens=_MAX_TOKENS, system=_SYSTEM,
                     tools=[EXTRACT_TOOL], tool_choice=_TOOL_CHOICE,
@@ -190,7 +190,7 @@ def _extract_batch(groups, client, model, usage) -> dict[str, ConvResult]:
 
     results = {}
     for conv, rows in groups.items():
-        seq = [raws.get(f"{conv}#{i}", {}) for i in range(order[conv])]
+        seq = [raws.get(f"{conv}-{i}", {}) for i in range(order[conv])]
         session = QualificationSession()
         ext = _ReplayExtractor(seq)
         for msg in _lead_texts(rows):
