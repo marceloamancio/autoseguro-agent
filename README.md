@@ -52,9 +52,9 @@ Variáveis (ver `.env.example` e `autoseguro/config.py`):
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | Modelo usado nas chamadas de conversa livre. |
 | `QUOTE_API_URL` | `http://localhost:8000` | Base URL do `quote-service`. |
 | `QUOTE_TIMEOUT_S` | `9.0` | Timeout por tentativa de `/quote` (`SLOW_SECONDS + 1`). |
-| `QUOTE_MAX_RETRIES` | `3` | Retries extras em falha de infra (5xx/timeout). |
+| `QUOTE_MAX_RETRIES` | `2` | Retries extras em falha de infra (5xx/timeout/429/408). |
 | `QUOTE_BACKOFF_BASE_S` | `0.5` | Base do backoff exponencial + jitter. |
-| `QUOTE_DEADLINE_S` | `25.0` | Deadline total sobre o conjunto de tentativas de uma chamada. |
+| `QUOTE_DEADLINE_S` | `30.0` | Deadline total sobre o conjunto de tentativas (coerente com retries×timeout). |
 | `QUOTE_CB_FAILURE_THRESHOLD` | `5` | Falhas de infra seguidas até o circuit breaker abrir. |
 | `QUOTE_CB_RESET_S` | `30.0` | Tempo aberto antes de sondar `/health` e tentar fechar. |
 
@@ -203,13 +203,15 @@ em `autoseguro/quote_client.py`:
 - **Timeout por tentativa = `SLOW_SECONDS + 1` (9s):** o mínimo que **captura a chamada
   lenta** (8s) como cotação válida, em vez de descartá-la. Menos que 8s jogaria fora ~10% de
   cotações boas; mais que 9s não ganha nada.
-- **3 tentativas extras**, backoff exponencial `0.5 → 1 → 2s` + jitter (evita thundering
-  herd em lote/replay); `/quote` é idempotente, então retry é seguro.
-- **Deadline total ~25s** sobre o conjunto de tentativas — estourou, vira sinal de handoff.
+- **Retry só em infra** (5xx, timeout, **429/408** — respeitando `Retry-After`); 422/400 são
+  negócio e **não** retentam. **2 tentativas extras** (3 no total), backoff exponencial
+  `0.5 → 1s` + jitter; `/quote` é idempotente, então retry é seguro.
+- **Deadline total ~30s**, coerente com `(retries+1)×timeout` (3×9=27 ≤ 30) — estourou, vira
+  sinal de handoff. O `config` avisa (log) se um override reintroduz incoerência.
 - **Circuit breaker leve:** abre após N falhas de infra seguidas → fast-fail sem martelar o
-  serviço; sonda `GET /health` (sempre estável no desafio) pra tentar fechar depois do
-  `reset_s`. Ganho real no modo replay/lote; no caminho de uma conversa isolada, o timeout +
-  retry já bastam na prática.
+  serviço; na meia-abertura sonda o **próprio `/quote`** (canary de uma tentativa), **não** o
+  `/health` — assim uma queda só da `/quote` mantém o breaker aberto; ele só fecha se o canary
+  voltar. Ganho real no modo replay/lote.
 - **Nunca inventa preço:** ao esgotar tentativas/deadline/breaker, o cliente levanta
   `QuoteUnavailable` (nunca um preço) e o agente transborda com contexto (`QUOTE_UNAVAILABLE`)
   — o preço só existe quando vem de uma resposta 200 real.

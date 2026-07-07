@@ -19,12 +19,16 @@ e dispara primeiro como `httpx.ReadTimeout` na conexão real.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
-from autoseguro.quote_client import QuoteClient, QuoteResult
+from autoseguro.quote_client import QuoteClient, QuoteResult, QuoteUnavailable
 
 from doubles import make_config
+
+PAYLOAD = {"plano_id": "essencial", "idade": 35, "veiculo_ano": 2020, "cep": "01000-000"}
 
 
 @pytest.mark.asyncio
@@ -75,3 +79,121 @@ async def test_slow_call_within_timeout_returns_quote(fake_quote):
         await client.aclose()
 
     assert isinstance(result, QuoteResult)
+
+
+# --- P0-5: 429/408 entram no retry (nao dao break na 1a tentativa) ---------
+
+
+@pytest.mark.asyncio
+async def test_429_consumes_full_retry_budget(fake_quote):
+    """Hoje `cotar` so trata `>=500` como infra retryavel -- 429 (rate limit,
+    tipicamente transitorio) cai no ramo "status inesperado" e desiste na
+    1a tentativa. Deve consumir o orcamento inteiro de tentativas
+    (`quote_max_retries + 1`), igual a um 503.
+    """
+    fake_quote.set_mode("fail_status", fail_status=429)
+
+    config = make_config(
+        quote_api_url=fake_quote.base_url,
+        quote_timeout_s=1.0,
+        quote_max_retries=2,
+        quote_backoff_base_s=0.02,
+        quote_deadline_s=5.0,
+        quote_cb_failure_threshold=100,
+        quote_cb_reset_s=30.0,
+    )
+    client = QuoteClient(config)
+    try:
+        with pytest.raises(QuoteUnavailable):
+            await client.cotar(PAYLOAD)
+    finally:
+        await client.aclose()
+
+    stats = fake_quote.stats()
+    assert stats["quote_calls"] == config.quote_max_retries + 1, (
+        "FURO: 429 nao consumiu o orcamento de tentativas "
+        f"(esperado {config.quote_max_retries + 1}, veio {stats['quote_calls']})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_408_consumes_full_retry_budget(fake_quote):
+    """Mesma prova do P0-5 para 408 (Request Timeout)."""
+    fake_quote.set_mode("fail_status", fail_status=408)
+
+    config = make_config(
+        quote_api_url=fake_quote.base_url,
+        quote_timeout_s=1.0,
+        quote_max_retries=2,
+        quote_backoff_base_s=0.02,
+        quote_deadline_s=5.0,
+        quote_cb_failure_threshold=100,
+        quote_cb_reset_s=30.0,
+    )
+    client = QuoteClient(config)
+    try:
+        with pytest.raises(QuoteUnavailable):
+            await client.cotar(PAYLOAD)
+    finally:
+        await client.aclose()
+
+    stats = fake_quote.stats()
+    assert stats["quote_calls"] == config.quote_max_retries + 1, (
+        "FURO: 408 nao consumiu o orcamento de tentativas "
+        f"(esperado {config.quote_max_retries + 1}, veio {stats['quote_calls']})"
+    )
+
+
+# --- P0-7: breaker half-open via canary no /quote, nao via /health --------
+
+
+@pytest.mark.asyncio
+async def test_breaker_probes_quote_not_health_and_reopens_when_quote_still_down(fake_quote):
+    """Depois do reset do breaker, a sonda de meia-abertura deve decidir pelo
+    `/quote` (canary) -- nunca pelo `/health` (que fica sempre `up` no
+    `fake_quote` por padrao). Com `/quote` ainda caido (500), o breaker deve
+    REABRIR, nao fechar so porque `/health` respondeu 200.
+    """
+    fake_quote.set_mode("fail_status", fail_status=500)
+
+    config = make_config(
+        quote_api_url=fake_quote.base_url,
+        quote_timeout_s=1.0,
+        quote_max_retries=0,
+        quote_backoff_base_s=0.01,
+        quote_deadline_s=5.0,
+        quote_cb_failure_threshold=1,
+        quote_cb_reset_s=0.05,
+    )
+    client = QuoteClient(config)
+    try:
+        # 1) abre o breaker (threshold=1).
+        with pytest.raises(QuoteUnavailable):
+            await client.cotar(PAYLOAD)
+
+        quote_calls_before = fake_quote.stats()["quote_calls"]
+
+        # 2) espera passar o reset_s -- a proxima chamada deve sondar via
+        # canary real no /quote (que ainda esta caido), nunca via /health.
+        await asyncio.sleep(0.08)
+        with pytest.raises(QuoteUnavailable):
+            await client.cotar(PAYLOAD)
+
+        stats = fake_quote.stats()
+        assert stats["quote_calls"] == quote_calls_before + 1, (
+            "a sonda de meia-abertura deveria ter batido no /quote (canary)"
+        )
+        assert stats["health_calls"] == 0, (
+            "FURO: o breaker sondou /health em vez de decidir pelo /quote real"
+        )
+
+        # 3) o breaker deve ter reaberto -- a proxima chamada imediata deve
+        # fast-fail sem bater no /quote de novo.
+        with pytest.raises(QuoteUnavailable) as exc_info:
+            await client.cotar(PAYLOAD)
+
+        stats = fake_quote.stats()
+        assert stats["quote_calls"] == quote_calls_before + 1  # nao incrementou
+        assert exc_info.value.reason == "circuit_breaker_aberto"
+    finally:
+        await client.aclose()

@@ -13,6 +13,7 @@ retries, backoff, deadline total e circuit breaker leve).
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 
@@ -21,6 +22,8 @@ from dotenv import load_dotenv
 # Carrega variáveis de um .env local (se existir) para o ambiente do processo.
 # Não sobrescreve variáveis já definidas no ambiente (ex.: exportadas pelo shell/CI).
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(RuntimeError):
@@ -79,14 +82,41 @@ def load_config() -> Config:
             "antes de rodar o agente."
         )
 
-    return Config(
+    config = Config(
         anthropic_api_key=api_key,
         anthropic_model=os.getenv("ANTHROPIC_MODEL") or "claude-sonnet-5",
         quote_api_url=os.getenv("QUOTE_API_URL") or "http://localhost:8000",
         quote_timeout_s=_get_float("QUOTE_TIMEOUT_S", 9.0),
-        quote_max_retries=_get_int("QUOTE_MAX_RETRIES", 3),
+        quote_max_retries=_get_int("QUOTE_MAX_RETRIES", 2),
         quote_backoff_base_s=_get_float("QUOTE_BACKOFF_BASE_S", 0.5),
-        quote_deadline_s=_get_float("QUOTE_DEADLINE_S", 25.0),
+        quote_deadline_s=_get_float("QUOTE_DEADLINE_S", 30.0),
         quote_cb_failure_threshold=_get_int("QUOTE_CB_FAILURE_THRESHOLD", 5),
         quote_cb_reset_s=_get_float("QUOTE_CB_RESET_S", 30.0),
     )
+    _warn_if_resilience_policy_incoherent(config)
+    return config
+
+
+def _warn_if_resilience_policy_incoherent(config: Config) -> None:
+    """Avisa (nunca vaza segredo) quando o orçamento total de tentativas —
+    `(quote_max_retries + 1) * quote_timeout_s` — excede `quote_deadline_s`
+    (P0-6): nesse caso o deadline corta a chamada antes do agente esgotar os
+    retries pretendidos, tornando `quote_max_retries` uma promessa vazia.
+
+    Os defaults de produção já são coerentes (`(2+1)*9=27 <= 30`); este aviso
+    cobre overrides vindos do ambiente que reintroduzam a incoerência — não
+    sobrescreve o valor do operador, só avisa.
+    """
+    total_retry_budget = (config.quote_max_retries + 1) * config.quote_timeout_s
+    if total_retry_budget > config.quote_deadline_s:
+        logger.warning(
+            "Config de resiliência incoerente: (quote_max_retries=%s + 1) * "
+            "quote_timeout_s=%ss = %.1fs excede quote_deadline_s=%ss -- o "
+            "deadline pode cortar a chamada antes do orçamento de tentativas "
+            "pretendido ser usado. Ajuste QUOTE_DEADLINE_S, QUOTE_MAX_RETRIES "
+            "e/ou QUOTE_TIMEOUT_S para que (retries+1)*timeout <= deadline.",
+            config.quote_max_retries,
+            config.quote_timeout_s,
+            total_retry_budget,
+            config.quote_deadline_s,
+        )

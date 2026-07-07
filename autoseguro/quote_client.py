@@ -6,15 +6,19 @@ Política de resiliência (ver `.genie/wishes/agente-autoseguro/WISH.md` e
 - **Timeout por tentativa = `quote_timeout_s`** (default 9s = `SLOW_SECONDS + 1`):
   suficiente pra capturar a chamada lenta de 8s do mock, tratando-a como cotação
   válida em vez de descartá-la.
-- **Retry só em infra** (5xx ou timeout/erro de transporte), com backoff
-  exponencial (`quote_backoff_base_s * 2**tentativa`) + jitter, até
+- **Retry só em infra** (5xx, 429/408, ou timeout/erro de transporte), com
+  backoff exponencial (`quote_backoff_base_s * 2**tentativa`) + jitter — que
+  respeita o cabeçalho `Retry-After` da resposta quando presente —, até
   `quote_max_retries` tentativas extras (nunca em 422/400 — seria desperdício e
   "burrice" do agente insistir numa recusa de regra ou payload malformado).
 - **Deadline total** (`quote_deadline_s`) sobre o conjunto de tentativas de uma
-  chamada — estourou, vira sinal de handoff.
+  chamada — estourou, vira sinal de handoff. Os defaults de produção mantêm
+  `(quote_max_retries + 1) * quote_timeout_s <= quote_deadline_s` (ver
+  `config.py`), senão o deadline cortaria antes do orçamento de retries.
 - **Circuit breaker leve:** abre após `quote_cb_failure_threshold` falhas de
-  infra seguidas → fast-fail sem martelar o serviço; sonda `GET /health`
-  (sempre estável) após `quote_cb_reset_s` pra tentar fechar.
+  infra seguidas → fast-fail sem martelar o serviço; após `quote_cb_reset_s`,
+  deixa passar **uma chamada real ao `/quote`** (canary) para decidir se
+  fecha — nunca sonda `/health`, que fica estável mesmo com `/quote` caído.
 - **Nunca inventa preço:** 422 vira `CotacaoRecusada`, 400 vira
   `PayloadInvalido`, e o esgotamento de retries/deadline/breaker vira
   `QuoteUnavailable` — sinal para o motor de handoff (Q6), carregando contexto.
@@ -110,8 +114,13 @@ class _CircuitBreaker:
     """Circuit breaker leve, contagem de falhas de infra consecutivas.
 
     Fechado -> passa tudo. Após `failure_threshold` falhas seguidas, abre
-    (fast-fail). Depois de `reset_s` de aberto, a próxima chamada pode sondar
-    `/health`; se ok, fecha; senão, reabre (reinicia o cronômetro de reset).
+    (fast-fail). Depois de `reset_s` de aberto, a próxima chamada vira um
+    *canary*: uma única tentativa real ao `/quote` decide o destino do
+    breaker — sucesso fecha (`record_success`), falha reabre
+    (`record_failure` reinicia o cronômetro de reset automaticamente, já que
+    `_consecutive_failures` permanece >= `failure_threshold`). Nunca sonda
+    `/health` (P0-7): `/health` fica estável mesmo com `/quote` caído, então
+    fechava o breaker incorretamente.
     """
 
     def __init__(self, failure_threshold: int, reset_s: float):
@@ -138,13 +147,9 @@ class _CircuitBreaker:
         if self._consecutive_failures >= self.failure_threshold:
             self._opened_at = time.monotonic()
 
-    def reopen(self) -> None:
-        """Sonda de /health falhou: continua aberto, reinicia o cronômetro."""
-        self._opened_at = time.monotonic()
-
 
 class QuoteClient:
-    """Cliente async resiliente para `POST /quote` (e `GET /health` interno)."""
+    """Cliente async resiliente para `POST /quote`."""
 
     def __init__(self, config: Config, *, transport: httpx.AsyncBaseTransport | None = None):
         self._config = config
@@ -175,9 +180,12 @@ class QuoteClient:
         """
         deadline = time.monotonic() + self._config.quote_deadline_s
 
-        await self._ensure_breaker_allows(payload)
+        # Se o breaker acabou de sair da janela de reset, esta chamada vira um
+        # canary: uma única tentativa real ao /quote decide se ele fecha ou
+        # reabre (P0-7) -- nunca consome o orçamento normal de retries.
+        is_canary = await self._ensure_breaker_allows(payload)
 
-        max_attempts = self._config.quote_max_retries + 1
+        max_attempts = 1 if is_canary else self._config.quote_max_retries + 1
         attempts = 0
         last_reason = "erro_desconhecido"
 
@@ -219,16 +227,21 @@ class QuoteClient:
                 detalhe = self._safe_json(response).get("detalhe", "payload inválido")
                 raise PayloadInvalido(detalhe)
 
-            if response.status_code >= 500:
+            # 5xx (infra caída), 429 (rate limit) e 408 (timeout do servidor)
+            # são todos infra retryável -- transitório, nunca "burrice" do
+            # agente insistir (P0-5). Respeita `Retry-After` se presente.
+            if response.status_code >= 500 or response.status_code in (429, 408):
                 last_reason = f"http_{response.status_code}"
                 self._breaker.record_failure()
                 if attempts >= max_attempts:
                     break
-                await self._sleep_backoff(attempts, deadline)
+                await self._sleep_backoff(
+                    attempts, deadline, retry_after=self._parse_retry_after(response)
+                )
                 continue
 
             # Status inesperado (nem sucesso, nem erro de negócio conhecido,
-            # nem 5xx): não inventamos preço nem insistimos às cegas.
+            # nem infra retryável): não inventamos preço nem insistimos às cegas.
             last_reason = f"http_inesperado_{response.status_code}"
             self._breaker.record_failure()
             break
@@ -252,9 +265,14 @@ class QuoteClient:
             timeout=self._config.quote_timeout_s,
         )
 
-    async def _ensure_breaker_allows(self, payload: dict[str, Any]) -> None:
+    async def _ensure_breaker_allows(self, payload: dict[str, Any]) -> bool:
+        """Retorna `True` se esta chamada deve ser tratada como canary
+        (sonda de meia-abertura via `/quote` real, P0-7), `False` se o
+        breaker está fechado (fluxo normal). Levanta `QuoteUnavailable` se o
+        breaker está aberto e a janela de reset ainda não passou.
+        """
         if not self._breaker.is_open:
-            return
+            return False
 
         elapsed = self._breaker.seconds_since_open()
         if elapsed is None or elapsed < self._breaker.reset_s:
@@ -262,32 +280,36 @@ class QuoteClient:
                 "circuit_breaker_aberto", attempts=0, context={"payload": payload}
             )
 
-        # Janela de reset passada: sonda /health antes de deixar passar.
-        if await self._probe_health():
-            self._breaker.record_success()
-            return
+        # Janela de reset passada: deixa UMA chamada real ao /quote decidir
+        # (nunca /health -- fica estável mesmo com /quote caído, ver P0-7).
+        return True
 
-        self._breaker.reopen()
-        raise QuoteUnavailable(
-            "circuit_breaker_aberto", attempts=0, context={"payload": payload}
-        )
-
-    async def _probe_health(self) -> bool:
-        try:
-            response = await asyncio.wait_for(
-                self._client.get("/health"), timeout=self._config.quote_timeout_s
-            )
-        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.TransportError):
-            return False
-        return response.status_code == 200
-
-    async def _sleep_backoff(self, attempt: int, deadline: float) -> None:
+    async def _sleep_backoff(
+        self, attempt: int, deadline: float, *, retry_after: float | None = None
+    ) -> None:
         base = self._config.quote_backoff_base_s
         delay = base * (2 ** (attempt - 1)) + random.uniform(0, base)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
         await asyncio.sleep(min(delay, remaining))
+
+    @staticmethod
+    def _parse_retry_after(response: httpx.Response) -> float | None:
+        """Lê o cabeçalho `Retry-After` (segundos) se presente e numérico.
+
+        Ignora silenciosamente o formato HTTP-date (raro em `429`/`408`) e
+        valores inválidos -- nesse caso o backoff exponencial padrão decide.
+        """
+        raw = response.headers.get("Retry-After")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
 
     @staticmethod
     def _safe_json(response: httpx.Response) -> dict[str, Any]:
