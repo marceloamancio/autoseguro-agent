@@ -43,7 +43,14 @@ EXTRACT_TOOL: dict[str, Any] = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "veiculo_ano": {"type": ["integer", "null"], "description": "Ano do veículo, ex.: 2008"},
+            "veiculo_ano": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Ano do veículo, ex.: 2008. Copie EXATAMENTE o ano de 4 "
+                    "dígitos que o lead escreveu; nunca substitua pelo ano "
+                    "atual nem arredonde."
+                ),
+            },
             "idade": {"type": ["integer", "null"], "description": "Idade do lead em anos"},
             "cep": {"type": ["string", "null"], "description": "CEP informado pelo lead"},
             "marca": {"type": ["string", "null"], "description": "Marca do veículo"},

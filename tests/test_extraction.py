@@ -277,6 +277,61 @@ def test_faixas_validas_no_limite_sao_aceitas():
 
 
 # ---------------------------------------------------------------------------
+# L3 (2ª rodada) — ano literal no texto é autoritativo sobre o do LLM.
+#
+# `veiculo_ano` muda o preço; um número de 4 dígitos que o lead DIGITOU é mais
+# confiável que a inferência não-determinística do LLM. O run ao vivo pegou
+# "Compass 2020" ser extraído como 2026 (ano corrente) e cotar o carro errado.
+# Quando o texto traz exatamente UM ano válido e o LLM diverge, vence o literal.
+# ---------------------------------------------------------------------------
+
+
+def test_l3_ano_literal_no_texto_sobrepoe_ano_divergente_do_llm():
+    # LLM alucina 2026 (ano corrente) a partir de "Compass 2020".
+    llm = StubLlmClient({"veiculo_ano": 2026, "idade": 35, "cep": "26703-384"})
+
+    result = extract_once(
+        "Jeep Compass 2020, tenho 35 anos, cep 26703-384", llm_client=llm
+    )
+
+    assert result.data.veiculo_ano == 2020
+    assert any("2020" in w and "2026" in w for w in result.warnings)
+
+
+def test_l3_sem_override_quando_llm_concorda_com_ano_literal():
+    llm = StubLlmClient({"veiculo_ano": 2020, "idade": 35, "cep": "26703-384"})
+
+    result = extract_once("Compass 2020, 35 anos, cep 26703-384", llm_client=llm)
+
+    assert result.data.veiculo_ano == 2020
+    # Sem divergência: nenhum aviso sobre o ano do veículo.
+    assert not any("veiculo_ano" in w or "literal" in w for w in result.warnings)
+
+
+def test_l3_multiplos_anos_no_texto_defere_ao_llm():
+    # Dois anos distintos no texto (troca de carro) -> ambíguo; o NLU do LLM
+    # decide qual é o veículo atual, sem override determinístico.
+    llm = StubLlmClient({"veiculo_ano": 2022, "idade": 40, "cep": "26703-384"})
+
+    result = extract_once(
+        "meu antigo era 2015, agora tenho um 2022, 40 anos, cep 26703-384",
+        llm_client=llm,
+    )
+
+    assert result.data.veiculo_ano == 2022
+
+
+def test_l3_ano_literal_fora_da_faixa_nao_sobrepoe_llm_valido():
+    # Literal 1901 casa o regex mas está fora da faixa da /quote (1950-2100);
+    # não faz sentido sobrepor um valor válido do LLM por um inutilizável.
+    llm = StubLlmClient({"veiculo_ano": 2020, "idade": 30, "cep": "26703-384"})
+
+    result = extract_once("carro 1901, 30 anos, cep 26703-384", llm_client=llm)
+
+    assert result.data.veiculo_ano == 2020
+
+
+# ---------------------------------------------------------------------------
 # Dado essencial (idade + veiculo_ano + cep) e handoff após N=2 tentativas
 # ---------------------------------------------------------------------------
 

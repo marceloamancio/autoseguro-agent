@@ -410,6 +410,44 @@ async def test_confirmation_clean_yes_still_quotes_normally():
     assert quote_client.calls[0]["idade"] == 35
 
 
+@pytest.mark.asyncio
+async def test_l3_confirmacao_e_cotacao_usam_ano_literal_nao_o_do_llm():
+    # L3 (2ª rodada) end-to-end: o extractor devolve o ano errado (2026), mas o
+    # lead digitou "2020" -> a confirmação já mostra 2020 (não 2026) e, ao
+    # confirmar, a /quote é chamada com o ano certo. Não cota o carro errado.
+    quote = make_quote()
+    quote_client = StubQuoteClient(result=quote)
+    # Turno 1: LLM alucina 2026 a partir de "Compass 2020". Turno 2 ("sim,
+    # confirmo") não traz ano nenhum, então o extractor real devolve
+    # veiculo_ano null e só o intent -- o 2020 já consolidado é preservado.
+    extractor = StubExtractor(
+        responses=[
+            {
+                "idade": 35,
+                "veiculo_ano": 2026,
+                "cep": "26703-384",
+                "marca": "Jeep",
+                "modelo": "Compass",
+                "intent": "provide_data",
+            },
+            {"intent": "confirm"},
+        ]
+    )
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    turn = await agent.handle_turn("Jeep Compass 2020, tenho 35 anos, CEP 26703-384")
+
+    assert agent.state.awaiting_confirmation is True
+    assert "2020" in turn.reply
+    assert "2026" not in turn.reply
+
+    await agent.handle_turn("sim, confirmo")
+
+    assert len(quote_client.calls) == 1
+    assert quote_client.calls[0]["veiculo_ano"] == 2020
+
+
 # ---------------------------------------------------------------------------
 # 1.3 (P0-3) — re-cotar após entrega: intent=requote ou dado essencial novo
 # reabre a qualificação/cotação em vez de cair silenciosamente no papo livre.
