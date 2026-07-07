@@ -411,20 +411,17 @@ async def test_confirmation_clean_yes_still_quotes_normally():
 
 
 @pytest.mark.asyncio
-async def test_l3_confirmacao_e_cotacao_usam_ano_literal_nao_o_do_llm():
-    # L3 (2ª rodada) end-to-end: o extractor devolve o ano errado (2026), mas o
-    # lead digitou "2020" -> a confirmação já mostra 2020 (não 2026) e, ao
-    # confirmar, a /quote é chamada com o ano certo. Não cota o carro errado.
+async def test_confirmacao_mostra_o_ano_do_llm_para_o_lead_conferir():
+    # Extração é 100% LLM; a defesa contra alucinação de ano é a CONFIRMAÇÃO.
+    # O agente exibe o ano que o LLM extraiu para o lead validar antes de cotar,
+    # e só cota com o valor confirmado.
     quote = make_quote()
     quote_client = StubQuoteClient(result=quote)
-    # Turno 1: LLM alucina 2026 a partir de "Compass 2020". Turno 2 ("sim,
-    # confirmo") não traz ano nenhum, então o extractor real devolve
-    # veiculo_ano null e só o intent -- o 2020 já consolidado é preservado.
     extractor = StubExtractor(
         responses=[
             {
                 "idade": 35,
-                "veiculo_ano": 2026,
+                "veiculo_ano": 2020,
                 "cep": "26703-384",
                 "marca": "Jeep",
                 "modelo": "Compass",
@@ -439,8 +436,7 @@ async def test_l3_confirmacao_e_cotacao_usam_ano_literal_nao_o_do_llm():
     turn = await agent.handle_turn("Jeep Compass 2020, tenho 35 anos, CEP 26703-384")
 
     assert agent.state.awaiting_confirmation is True
-    assert "2020" in turn.reply
-    assert "2026" not in turn.reply
+    assert "2020" in turn.reply  # ano exibido para conferência do lead
 
     await agent.handle_turn("sim, confirmo")
 

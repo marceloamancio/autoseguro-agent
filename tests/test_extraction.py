@@ -4,10 +4,10 @@ Cobre:
 - Extração via LLM mockado (structured outputs) de fixtures de texto livre do
   desafio ("e um Sandero 2022", "Toyota Corolla, ano 2008", "tenho 35 anos, cep
   26703-384").
-- Normalização: ano com 2 ou 4 dígitos, CEP com/sem hífen, "nasci em AAAA" → idade
-  coerente com o ano corrente.
-- Backstop regex leve: com o LLM mockado falhando/retornando vazio, o regex ainda
-  extrai ano (19xx/20xx) e CEP diretamente do texto.
+- Normalização de FORMATO do valor que o LLM devolveu: ano 2→4 dígitos, CEP
+  com/sem hífen, data → ISO. Nenhum regex garimpa a mensagem crua.
+- Extração 100% LLM: sem cliente (ou LLM sem dado), nada é extraído -- não há
+  regex de fallback (que quebrava no adversarial, ex.: ano pescado de telefone).
 - Dado essencial (idade + veiculo_ano + cep): função que aponta o que falta e sinal
   de handoff após N=2 tentativas (parametrizável).
 - Validação de faixas (idade 0–200, veiculo_ano 1950–2100): fora da faixa é inválido.
@@ -18,7 +18,6 @@ Nenhum teste chama a API real da Anthropic — o "cliente LLM" é sempre um dubl
 
 from __future__ import annotations
 
-import logging
 from datetime import date
 
 import pytest
@@ -133,112 +132,52 @@ def test_normalize_idade_aceita_inteiro_ou_string_numerica():
     assert normalize_idade("35") == 35
 
 
-def test_normalize_idade_a_partir_de_nasci_em_ano():
-    ano_atual = date.today().year
-    esperado = ano_atual - 1989
-
-    assert normalize_idade("nasci em 1989") == esperado
-
-
 # ---------------------------------------------------------------------------
-# 3.2 (P2-2) — "nasci em dd/mm/aaaa" (data completa) calcula idade exata;
-# só o ano segue como antes, mas loga warning de ±1 na fronteira 75/76.
+# Extração 100% LLM — nenhum regex garimpa a mensagem crua do lead.
+#
+# Regex não é flexível o bastante e sempre erra no adversarial. O caso real
+# que motivou remover o backstop: o lead manda um telefone
+# ("+55 62 95496-2080") e o regex antigo pescava "2080" como ano do veículo,
+# poluindo a cotação com PII. Agora o LLM devolve veiculo_ano=None nesse turno
+# e nada é inventado.
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_idade_data_completa_calcula_idade_exata_respeitando_mes_dia():
-    hoje = date.today()
-    nascimento = date(1990, 12, 31)  # dia/mês tipicamente ainda não chegado no ano
-    esperado = hoje.year - nascimento.year
-    if (hoje.month, hoje.day) < (nascimento.month, nascimento.day):
-        esperado -= 1
+def test_extract_once_nao_garimpa_ano_de_pii_quando_llm_devolve_none():
+    # LLM (corretamente) não vê carro num telefone -> veiculo_ano=None.
+    llm = StubLlmClient({"veiculo_ano": None, "cep": None, "idade": None})
 
-    assert normalize_idade("nasci em 31/12/1990") == esperado
+    result = extract_once("o whats é esse mesmo +55 62 95496-2080", llm_client=llm)
 
-
-def test_normalize_idade_data_completa_aniversario_ja_passado_no_ano():
-    hoje = date.today()
-    nascimento = date(1990, 1, 1)  # dia/mês certamente já passou (exceto em 1º/jan)
-    esperado = hoje.year - nascimento.year
-    if (hoje.month, hoje.day) < (nascimento.month, nascimento.day):
-        esperado -= 1
-
-    assert normalize_idade("nasci em 01/01/1990") == esperado
+    assert result.data.veiculo_ano is None
+    assert result.data.cep is None
 
 
-def test_normalize_idade_data_completa_invalida_cai_no_fallback_de_ano():
-    # "31/02" não existe -- não deve derrubar a extração, só ignora o
-    # dia/mês inválidos e segue o comportamento de só-ano.
-    ano_atual = date.today().year
-    esperado = ano_atual - 1990
+def test_extract_once_usa_so_o_que_o_llm_devolve():
+    llm = StubLlmClient({"veiculo_ano": 2015, "idade": 40, "cep": "04125-060"})
 
-    assert normalize_idade("nasci em 31/02/1990") == esperado
+    result = extract_once("Onix 2015, 40 anos, cep 04125-060", llm_client=llm)
 
-
-def test_normalize_idade_so_ano_perto_da_fronteira_75_76_loga_warning(caplog):
-    ano_boundary = date.today().year - 75
-
-    with caplog.at_level(logging.WARNING):
-        idade = normalize_idade(f"nasci em {ano_boundary}")
-
-    assert idade == 75
-    assert any("75" in rec.message and "76" in rec.message for rec in caplog.records)
-
-
-def test_normalize_idade_so_ano_longe_da_fronteira_nao_loga_warning(caplog):
-    ano_longe = date.today().year - 30
-
-    with caplog.at_level(logging.WARNING):
-        idade = normalize_idade(f"nasci em {ano_longe}")
-
-    assert idade == 30
-    assert caplog.records == []
-
-
-def test_extract_once_normaliza_nasci_em_do_texto_quando_llm_devolve_frase():
-    # O LLM pode devolver o campo idade como a frase capturada, cabe à
-    # normalização converter para um inteiro coerente com o ano corrente.
-    llm = StubLlmClient({"idade": "nasci em 1989", "veiculo_ano": 2010, "cep": "01310-000"})
-
-    result = extract_once("Nasci em 1989, o carro é de 2010", llm_client=llm)
-
-    assert result.data.idade == date.today().year - 1989
-
-
-# ---------------------------------------------------------------------------
-# Backstop regex leve (ano + CEP), usado quando o LLM falha ou volta vazio
-# ---------------------------------------------------------------------------
-
-
-def test_backstop_regex_extrai_ano_quando_llm_falha():
-    llm = StubLlmClient(raises=True)
-
-    result = extract_once("Tenho um Onix 2015 aqui, cep 04125-060", llm_client=llm)
-
-    assert result.llm_used is False
     assert result.data.veiculo_ano == 2015
+    assert result.data.idade == 40
     assert result.data.cep == "04125-060"
 
 
-def test_backstop_regex_extrai_ano_e_cep_quando_llm_devolve_vazio():
-    llm = StubLlmClient({})
-
-    result = extract_once("Meu carro é 2019, moro no cep 26703384", llm_client=llm)
-
-    assert result.data.veiculo_ano == 2019
-    assert result.data.cep == "26703-384"
-
-
-def test_backstop_regex_funciona_sem_llm_client_nenhum():
+def test_extract_once_sem_llm_nao_extrai_nada():
+    # LLM-down está fora do escopo do desafio: sem cliente, nada é extraído
+    # (não há regex de fallback). A robustez vem da confirmação com o lead.
     result = extract_once("Carro 2013, cep 30130-000", llm_client=None)
 
     assert result.llm_used is False
-    assert result.data.veiculo_ano == 2013
-    assert result.data.cep == "30130-000"
+    assert result.data.veiculo_ano is None
+    assert result.data.cep is None
+    assert result.data.idade is None
 
 
-def test_backstop_nao_inventa_dado_ausente_no_texto():
-    result = extract_once("oi, tudo bem?", llm_client=None)
+def test_extract_once_nao_inventa_dado_ausente():
+    llm = StubLlmClient({})
+
+    result = extract_once("oi, tudo bem?", llm_client=llm)
 
     assert result.data.veiculo_ano is None
     assert result.data.cep is None
@@ -277,56 +216,20 @@ def test_faixas_validas_no_limite_sao_aceitas():
 
 
 # ---------------------------------------------------------------------------
-# L3 (2ª rodada) — ano literal no texto é autoritativo sobre o do LLM.
+# veiculo_ano vem do LLM, sem cross-check de regex sobre o texto.
 #
-# `veiculo_ano` muda o preço; um número de 4 dígitos que o lead DIGITOU é mais
-# confiável que a inferência não-determinística do LLM. O run ao vivo pegou
-# "Compass 2020" ser extraído como 2026 (ano corrente) e cotar o carro errado.
-# Quando o texto traz exatamente UM ano válido e o LLM diverge, vence o literal.
+# Antes um regex sobrepunha o LLM com o "ano literal" do texto (fix L3 da 2ª
+# rodada). Isso foi removido: regex quebra no adversarial (ex.: pegar o ano de
+# dentro de um telefone). O valor do LLM é usado como veio; a defesa contra
+# alucinação de ano é a CONFIRMAÇÃO com o lead antes de cotar (test_agent.py),
+# não um segundo extrator.
 # ---------------------------------------------------------------------------
 
 
-def test_l3_ano_literal_no_texto_sobrepoe_ano_divergente_do_llm():
-    # LLM alucina 2026 (ano corrente) a partir de "Compass 2020".
-    llm = StubLlmClient({"veiculo_ano": 2026, "idade": 35, "cep": "26703-384"})
-
-    result = extract_once(
-        "Jeep Compass 2020, tenho 35 anos, cep 26703-384", llm_client=llm
-    )
-
-    assert result.data.veiculo_ano == 2020
-    assert any("2020" in w and "2026" in w for w in result.warnings)
-
-
-def test_l3_sem_override_quando_llm_concorda_com_ano_literal():
+def test_veiculo_ano_usa_valor_do_llm_sem_cross_check_de_texto():
     llm = StubLlmClient({"veiculo_ano": 2020, "idade": 35, "cep": "26703-384"})
 
-    result = extract_once("Compass 2020, 35 anos, cep 26703-384", llm_client=llm)
-
-    assert result.data.veiculo_ano == 2020
-    # Sem divergência: nenhum aviso sobre o ano do veículo.
-    assert not any("veiculo_ano" in w or "literal" in w for w in result.warnings)
-
-
-def test_l3_multiplos_anos_no_texto_defere_ao_llm():
-    # Dois anos distintos no texto (troca de carro) -> ambíguo; o NLU do LLM
-    # decide qual é o veículo atual, sem override determinístico.
-    llm = StubLlmClient({"veiculo_ano": 2022, "idade": 40, "cep": "26703-384"})
-
-    result = extract_once(
-        "meu antigo era 2015, agora tenho um 2022, 40 anos, cep 26703-384",
-        llm_client=llm,
-    )
-
-    assert result.data.veiculo_ano == 2022
-
-
-def test_l3_ano_literal_fora_da_faixa_nao_sobrepoe_llm_valido():
-    # Literal 1901 casa o regex mas está fora da faixa da /quote (1950-2100);
-    # não faz sentido sobrepor um valor válido do LLM por um inutilizável.
-    llm = StubLlmClient({"veiculo_ano": 2020, "idade": 30, "cep": "26703-384"})
-
-    result = extract_once("carro 1901, 30 anos, cep 26703-384", llm_client=llm)
+    result = extract_once("Jeep Compass 2020, 35 anos, cep 26703-384", llm_client=llm)
 
     assert result.data.veiculo_ano == 2020
 
@@ -371,9 +274,8 @@ def test_qualification_session_sinaliza_handoff_apos_n_tentativas_sem_essencial(
 
 
 def test_qualification_session_completa_antes_do_limite_nao_precisa_handoff():
-    # Idade não é coberta pelo backstop regex (por design — só ano/CEP são
-    # "rede de segurança" leve); chega via LLM, como no fluxo real.
-    llm = StubLlmClient({"idade": 35})
+    # Todos os essenciais chegam via LLM (único extrator), como no fluxo real.
+    llm = StubLlmClient({"idade": 35, "veiculo_ano": 2015, "cep": "26703-384"})
     session = QualificationSession(max_attempts=2)
 
     session.process_turn(
@@ -385,11 +287,16 @@ def test_qualification_session_completa_antes_do_limite_nao_precisa_handoff():
 
 
 def test_qualification_session_acumula_dados_entre_turnos():
+    # Acúmulo turno a turno: o LLM traz o ano num turno e idade+CEP no seguinte.
     session = QualificationSession(max_attempts=2)
-    llm_idade = StubLlmClient({"idade": 35})
 
-    session.process_turn("meu carro é de 2015", llm_client=None)
-    session.process_turn("tenho 35 anos, cep 26703-384", llm_client=llm_idade)
+    session.process_turn(
+        "meu carro é de 2015", llm_client=StubLlmClient({"veiculo_ano": 2015})
+    )
+    session.process_turn(
+        "tenho 35 anos, cep 26703-384",
+        llm_client=StubLlmClient({"idade": 35, "cep": "26703-384"}),
+    )
 
     assert session.data.veiculo_ano == 2015
     assert session.data.idade == 35
