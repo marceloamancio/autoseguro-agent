@@ -38,3 +38,31 @@ def test_integra_com_classify_fuzzy():
     decision = classify_fuzzy("quero abrir um sinistro", KeywordFuzzyClassifier())
     assert decision is not None
     assert decision.reason == HandoffReason.OUT_OF_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# P1-2 — substrings largas demais ("processo", "cobrança"/"cobranca") davam
+# falso-positivo em perguntas legítimas; endurecidas para frases específicas.
+# ---------------------------------------------------------------------------
+
+
+def test_pergunta_sobre_processo_de_contratacao_nao_e_reclamacao():
+    c = KeywordFuzzyClassifier()
+    assert c.classify("qual o processo pra contratar?") is None
+
+
+def test_pergunta_sobre_cobranca_mensal_nao_e_fora_de_escopo():
+    c = KeywordFuzzyClassifier()
+    assert c.classify("como funciona a cobrança mensal?") is None
+    assert c.classify("como funciona a cobranca mensal?") is None
+
+
+def test_abrir_processo_de_verdade_ainda_e_reclamacao():
+    c = KeywordFuzzyClassifier()
+    assert c.classify("quero abrir um processo contra vocês") == HandoffReason.COMPLAINT_CONFLICT
+    assert c.classify("vou abrir processo na justiça") == HandoffReason.COMPLAINT_CONFLICT
+
+
+def test_cobranca_indevida_de_verdade_ainda_e_fora_de_escopo():
+    c = KeywordFuzzyClassifier()
+    assert c.classify("tive uma cobrança indevida no meu cartão") == HandoffReason.OUT_OF_SCOPE

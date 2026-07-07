@@ -22,6 +22,7 @@ import pytest
 from autoseguro import cli
 from autoseguro.agent import Agent
 from autoseguro.extraction import QualificationSession
+from autoseguro.handoff import HandoffReason
 from autoseguro.quote_client import QuoteResult
 from autoseguro.tracing import Tracer
 
@@ -219,6 +220,128 @@ async def test_run_repl_logs_handoff_with_reason_code_when_quote_unavailable(tmp
 
     decision_events = [e for e in events if e["type"] == "decision"]
     assert any(e["status"] == "handoff" for e in decision_events)
+
+
+# ---------------------------------------------------------------------------
+# 2.3 (P1-3) — CLI parseia o marcador líder de mídia e passa `media_type`
+# pro `Agent.handle_turn` (antes, código morto: `MEDIA_UNREADABLE` nunca
+# disparava na entrega real).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cli_media_marker_triggers_media_unreadable(tmp_path):
+    quote_client = StubQuoteClient(result=make_quote())
+    extractor = StubExtractor({})
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    tracer = Tracer(path=tmp_path / "trace.jsonl")
+
+    input_fn = _make_input_fn(["[documento] CNH_frente.pdf", "sair"])
+    outputs: list[str] = []
+
+    await cli.run_repl(agent, tracer, input_fn=input_fn, output_fn=outputs.append)
+    tracer.close()
+
+    assert agent.state.handoff is not None
+    assert agent.state.handoff.reason == HandoffReason.MEDIA_UNREADABLE
+    assert quote_client.calls == []  # nunca tratou o marcador como texto de qualificação
+
+
+@pytest.mark.asyncio
+async def test_cli_regular_text_still_qualifies_normally(tmp_path):
+    quote = make_quote()
+    quote_client = StubQuoteClient(result=quote)
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2008, "cep": "26703-384"})
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    tracer = Tracer(path=tmp_path / "trace.jsonl")
+
+    input_fn = _make_input_fn(
+        ["Tenho um Corolla 2008, 35 anos, CEP 26703-384", "sim, confirmo", "sair"]
+    )
+    outputs: list[str] = []
+
+    await cli.run_repl(agent, tracer, input_fn=input_fn, output_fn=outputs.append)
+    tracer.close()
+
+    assert agent.state.handoff is None
+    assert len(quote_client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "raw, expected_text, expected_media_type",
+    [
+        ("[documento] CNH_frente.pdf", "CNH_frente.pdf", "document"),
+        ("[imagem] foto.png", "foto.png", "image"),
+        ("[foto] carro.jpg", "carro.jpg", "image"),
+        ("[audio] mensagem.ogg", "mensagem.ogg", "audio"),
+        ("Tenho 35 anos", "Tenho 35 anos", None),
+    ],
+)
+def test_parse_media_marker(raw, expected_text, expected_media_type):
+    text, media_type = cli.parse_media_marker(raw)
+
+    assert text == expected_text
+    assert media_type == expected_media_type
+
+
+# ---------------------------------------------------------------------------
+# 2.4 (P1-1) — log entregue/curado: varredura LLM em lote, fora do hot-path
+# ---------------------------------------------------------------------------
+
+
+def test_cure_delivered_log_calls_sweep_once_in_batch_and_masks_beyond_regex():
+    calls = []
+
+    def fake_sweep(texts, categories):
+        calls.append((list(texts), list(categories)))
+        return [t.replace("Fulano de Tal", "⟨NOME_TERCEIRO⟩") for t in texts]
+
+    events = [
+        {
+            "type": "message.in",
+            "message_body": "cpf 389.083.863-43, e Fulano de Tal confirma",
+        },
+        {"type": "message.out", "message_body": "sem nenhuma pii aqui"},
+    ]
+
+    cured = cli.cure_delivered_log(events, llm_client=fake_sweep)
+
+    assert len(calls) == 1  # uma única chamada em lote pro log inteiro
+    assert "⟨CPF⟩" in cured[0]["message_body"]
+    assert "⟨NOME_TERCEIRO⟩" in cured[0]["message_body"]
+    assert cured[1]["message_body"] == "sem nenhuma pii aqui"
+    # não muta os eventos originais
+    assert events[0]["message_body"] == "cpf 389.083.863-43, e Fulano de Tal confirma"
+
+
+def test_cure_delivered_log_sem_llm_client_aplica_so_o_regex():
+    events = [{"type": "message.in", "message_body": "cpf 389.083.863-43"}]
+
+    cured = cli.cure_delivered_log(events)
+
+    assert cured[0]["message_body"] == "cpf ⟨CPF⟩"
+
+
+def test_cure_delivered_log_ignora_campos_de_texto_nao_configurados():
+    events = [{"message_body": "cpf 389.083.863-43", "sender_name": "Fulano de Tal"}]
+
+    cured = cli.cure_delivered_log(events, text_fields=("message_body",))
+
+    assert cured[0]["sender_name"] == "Fulano de Tal"
+
+
+def test_write_jsonl_grava_um_evento_por_linha(tmp_path):
+    events = [{"a": 1}, {"b": 2}]
+    path = tmp_path / "delivered.jsonl"
+
+    cli.write_jsonl(path, events)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == events
 
 
 # ---------------------------------------------------------------------------

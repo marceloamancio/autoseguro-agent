@@ -9,27 +9,27 @@ Trace estruturado bruto (mascarado): [`traces/execucao-falha-handoff.trace.jsonl
 
 ## Conversa (mascarada)
 
-> **Lead:** Oi, quero um seguro pro meu carro.
+> **Lead:** Oi, preciso de uma cotação de seguro
 >
 > **Agente:** Pra eu conseguir cotar, me conta sua idade, o ano do seu veículo, o CEP onde
 > o carro fica? Se já souber, me diga também quando você quer que o seguro comece a valer
 > (data de início).
 >
-> **Lead:** Toyota Corolla 2008, tenho 35 anos, CEP `⟨CEP⟩`, começar em 15/08/2026.
+> **Lead:** Tenho 35 anos, um Corolla 2018, CEP `⟨CEP⟩`, plano essencial, início 15/08/2026
 >
-> **Agente:** Só confirmando antes de cotar: você tem 35 anos, veículo Toyota Corolla 2008,
+> **Agente:** Só confirmando antes de cotar: você tem 35 anos, veículo Toyota Corolla 2018,
 > CEP `⟨CEP⟩`. Está correto?
 >
-> **Lead:** sim, está correto
+> **Lead:** sim, pode confirmar
 >
 > **Agente:** No momento não estou conseguindo confirmar sua cotação — nosso sistema de
 > cálculo está instável. Vou te encaminhar para um consultor humano continuar o atendimento.
 
 ## O que este log demonstra
 
-- **Resiliência:** o cliente da `/quote` fez **4 tentativas** (1 + 3 retries com backoff),
-  todas falharam (`http_502`) — visível no trace: `"attempts": 4`,
-  `"reason": "esgotou_tentativas:http_502"`, `"status": "unavailable"`.
+- **Resiliência:** o cliente da `/quote` fez **3 tentativas** (1 + 2 retries com backoff),
+  todas falharam — visível no trace: `"attempts": 3`,
+  `"reason": "esgotou_tentativas:http_503"`, `"status": "unavailable"`.
 - **Nunca inventa preço:** ao esgotar, o agente **não fabrica** uma cotação.
 - **Handoff explícito e defensável:** transborda com `reason_code: quote_unavailable`
   (fronteira de **capacidade** — infra fora do controle do agente), registrado no trace.

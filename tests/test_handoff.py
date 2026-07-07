@@ -21,6 +21,7 @@ from autoseguro.handoff import (
     HandoffDecision,
     HandoffReason,
     classify_fuzzy,
+    classify_scope,
     for_agent_error,
     for_clarify_loop_exhausted,
     for_complaint_conflict,
@@ -130,6 +131,31 @@ def test_regular_message_does_not_trigger_explicit_request():
     assert for_explicit_request("quero um seguro pro meu carro") is None
 
 
+# ---------------------------------------------------------------------------
+# P1-2 — stopgap endurecido: "gerente"/"supervisor" exige verbo de pedido por
+# perto (falso-positivo do red-team: "sou gerente de vendas, quero cotar").
+# ---------------------------------------------------------------------------
+
+
+def test_mencao_a_cargo_do_proprio_lead_nao_dispara_explicit_request():
+    assert for_explicit_request("sou gerente de vendas, quero cotar") is None
+    assert for_explicit_request("meu supervisor pediu pra eu cotar aqui") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "chama o gerente por favor",
+        "quero falar com o supervisor",
+        "passa pra o gerente, por favor",
+    ],
+)
+def test_pedido_real_de_gerente_ou_supervisor_ainda_dispara_explicit_request(text):
+    decision = for_explicit_request(text)
+    assert decision is not None
+    assert decision.reason == HandoffReason.EXPLICIT_REQUEST
+
+
 def test_clarify_loop_exhausted_after_max_attempts_without_essential_data():
     session = QualificationSession(max_attempts=2)
     session.attempts = 2
@@ -234,3 +260,50 @@ def test_plan_not_in_catalog_never_generates_handoff():
 
 def test_price_objection_never_generates_handoff():
     assert resolve_price_objection("tem desconto? tá caro demais") is None
+
+
+# ---------------------------------------------------------------------------
+# 2.1 — `classify_scope`: usa o sinal de intenção (fundido na extração) em
+# vez do substring cru; cai no stopgap (regex/keyword) só quando o sinal não
+# ajuda ("other"/"provide_data"/etc., ex.: sem extractor plugado).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_scope_usa_intent_explicit_human_sem_precisar_de_regex():
+    decision = classify_scope("explicit_human", "pode me ajudar com isso?", None)
+
+    assert decision is not None
+    assert decision.reason == HandoffReason.EXPLICIT_REQUEST
+
+
+def test_classify_scope_usa_intent_out_of_scope():
+    decision = classify_scope("out_of_scope", "como funciona a cobrança mensal?", None)
+
+    assert decision is not None
+    assert decision.reason == HandoffReason.OUT_OF_SCOPE
+
+
+def test_classify_scope_usa_intent_complaint():
+    decision = classify_scope("complaint", "qual o processo pra contratar?", None)
+
+    assert decision is not None
+    assert decision.reason == HandoffReason.COMPLAINT_CONFLICT
+
+
+def test_classify_scope_provide_data_intent_nao_dispara_handoff_por_si_so():
+    # "sou gerente de vendas, quero cotar" -- intent=provide_data (o lead só
+    # está descrevendo a própria profissão) -- sem handoff.
+    decision = classify_scope("provide_data", "sou gerente de vendas, quero cotar", None)
+
+    assert decision is None
+
+
+def test_classify_scope_cai_no_stopgap_quando_intent_nao_ajuda():
+    # Sem sinal de intenção (extractor não plugado / "other") -- ainda cai no
+    # regex/keyword endurecido como rede de segurança.
+    decision = classify_scope("other", "quero falar com um atendente", None)
+
+    assert decision is not None
+    assert decision.reason == HandoffReason.EXPLICIT_REQUEST
+
+    assert classify_scope("other", "sou gerente de vendas, quero cotar", None) is None

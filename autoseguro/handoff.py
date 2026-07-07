@@ -174,25 +174,36 @@ def for_policy_issuance(text: str) -> HandoffDecision | None:
     return None
 
 
+#  "atendente"/"humano"/"pessoa de verdade"/"falar com alguém" já são
+# inequívocos por si só. "gerente"/"supervisor" são ambíguos (o lead pode só
+# estar descrevendo o próprio cargo, ex.: "sou gerente de vendas, quero
+# cotar") -- endurecido (P1-2/stopgap) pra só disparar quando há um verbo de
+# pedido logo antes (falar com/quero/chamar/chama/passa pra/passa para).
 _EXPLICIT_REQUEST_RE = re.compile(
-    r"\b(atendente|humano|gerente|supervisor)\b"
+    r"\b(atendente|humano)\b"
     r"|pessoa\s+de\s+verdade"
-    r"|falar\s+com\s+(algu[ée]m|uma\s+pessoa)",
+    r"|falar\s+com\s+(algu[ée]m|uma\s+pessoa)"
+    r"|(?:falar\s+com|quero|chamar|chama|passa\s+pra|passa\s+para)\s+(?:o\s+|a\s+)?(gerente|supervisor)",
     re.IGNORECASE,
 )
+
+
+def _build_explicit_request_decision(text: str) -> HandoffDecision:
+    return HandoffDecision(
+        reason=HandoffReason.EXPLICIT_REQUEST,
+        message="Sem problemas! Vou te encaminhar para um atendente humano agora.",
+        context={"trigger_text": text},
+    )
 
 
 def for_explicit_request(text: str) -> HandoffDecision | None:
     """Lead pede humano explicitamente (Respeito ao lead — imediato).
 
-    Retorna `None` quando não há pedido explícito no texto.
+    Retorna `None` quando não há pedido explícito no texto. Stopgap
+    regex-based (ver `classify_scope` pro caminho primário via `intent`).
     """
     if _EXPLICIT_REQUEST_RE.search(text):
-        return HandoffDecision(
-            reason=HandoffReason.EXPLICIT_REQUEST,
-            message="Sem problemas! Vou te encaminhar para um atendente humano agora.",
-            context={"trigger_text": text},
-        )
+        return _build_explicit_request_decision(text)
     return None
 
 
@@ -311,6 +322,47 @@ def classify_fuzzy(text: str, classifier: FuzzyClassifier | None) -> HandoffDeci
     return _FUZZY_BUILDERS[reason](text)
 
 
+# Mapeia intenção (2.1, fundida no EXTRACT_TOOL) direto pro builder do motivo
+# fuzzy correspondente -- dispensa o classificador/regex quando o sinal já
+# veio da própria extração.
+_INTENT_TO_FUZZY_BUILDER = {
+    "out_of_scope": for_out_of_scope,
+    "complaint": for_complaint_conflict,
+}
+
+
+def classify_scope(
+    intent: str | None,
+    text: str,
+    fuzzy_classifier: "FuzzyClassifier | None" = None,
+) -> HandoffDecision | None:
+    """Decide escopo/handoff a partir do sinal de intenção (2.1, P1-2).
+
+    Ordem: primeiro o sinal de `intent` (vem fundido na mesma chamada de
+    extração — sem custo extra de LLM); só cai no stopgap
+    (`for_explicit_request` + `classify_fuzzy`/`KeywordFuzzyClassifier`)
+    quando `intent` não ajuda (`None`/`"other"`/`"provide_data"`/etc. -- ex.:
+    extractor não plugado, ou o LLM não viu sinal de escopo no turno).
+
+    Nunca é o LLM quem *decide* transbordar — só classifica; a decisão e a
+    `HandoffDecision` auditável continuam sendo montadas aqui, de forma
+    determinística.
+    """
+    if intent == "explicit_human":
+        return _build_explicit_request_decision(text)
+    builder = _INTENT_TO_FUZZY_BUILDER.get(intent or "")
+    if builder is not None:
+        return builder(text)
+
+    # Stopgap: sem sinal de intenção útil -- regex/keyword endurecidos como
+    # rede de segurança.
+    return for_explicit_request(text) or classify_fuzzy(text, fuzzy_classifier)
+
+
+_COMPLAINT_ABRIR_PROCESSO_RE = re.compile(r"abrir\s+(um\s+)?processo", re.IGNORECASE)
+_OUT_OF_SCOPE_COBRANCA_INDEVIDA_RE = re.compile(r"cobran[çc]a\s+indevida", re.IGNORECASE)
+
+
 class KeywordFuzzyClassifier:
     """`FuzzyClassifier` determinístico por palavras-chave (sem LLM).
 
@@ -319,25 +371,31 @@ class KeywordFuzzyClassifier:
     token. Conservador de propósito: em caso de dúvida retorna `None` e a mensagem
     segue no fluxo normal de qualificação. `CONTRADICTORY_DATA` não é inferido por
     keyword (depende de inconsistência de dados, não de vocabulário).
+
+    Substrings largas demais foram endurecidas para frases específicas (P1-2 —
+    falso-positivo do red-team): "processo" (bare) casava "qual o processo pra
+    contratar?"; "cobrança"/"cobranca" (bare) casava "como funciona a cobrança
+    mensal?". Agora exigem a frase completa (`abrir processo`, `cobrança
+    indevida`).
     """
 
     _OUT_OF_SCOPE = (
         "sinistro", "boleto", "segunda via", "2a via", "2ª via", "cancelar seguro",
         "cancelar apólice", "cancelar apolice", "cancelamento", "seguro residencial",
-        "seguro de vida", "seguro viagem", "reembolso", "cobrança", "cobranca",
+        "seguro de vida", "seguro viagem", "reembolso",
     )
     _COMPLAINT = (
         "reclamação", "reclamacao", "reclamar", "procon", "processar", "advogado",
-        "jurídico", "juridico", "processo", "absurdo", "ridículo", "ridiculo",
+        "jurídico", "juridico", "absurdo", "ridículo", "ridiculo",
         "péssimo", "pessimo", "vergonha", "descaso",
     )
 
     def classify(self, text: str) -> "HandoffReason | None":
         low = text.lower()
         # Reclamação tem prioridade: "quero cancelar, isso é um absurdo" → conflito.
-        if any(k in low for k in self._COMPLAINT):
+        if any(k in low for k in self._COMPLAINT) or _COMPLAINT_ABRIR_PROCESSO_RE.search(low):
             return HandoffReason.COMPLAINT_CONFLICT
-        if any(k in low for k in self._OUT_OF_SCOPE):
+        if any(k in low for k in self._OUT_OF_SCOPE) or _OUT_OF_SCOPE_COBRANCA_INDEVIDA_RE.search(low):
             return HandoffReason.OUT_OF_SCOPE
         # Cancelamento de apólice/seguro existente (fora do escopo de vendas),
         # tolerante a palavras no meio ("cancelar MEU seguro").

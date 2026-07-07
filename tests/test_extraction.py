@@ -18,6 +18,7 @@ Nenhum teste chama a API real da Anthropic — o "cliente LLM" é sempre um dubl
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pytest
@@ -28,6 +29,7 @@ from autoseguro.extraction import (
     extract_once,
     normalize_ano,
     normalize_cep,
+    normalize_data_inicio,
     normalize_idade,
 )
 
@@ -119,6 +121,13 @@ def test_normalize_cep_invalido_retorna_none():
     assert normalize_cep("123") is None
 
 
+def test_normalize_cep_aceita_int_preservando_zero_a_esquerda():
+    # 3.1 (P2-1): CEP de alto risco (07xxx-xxx) chega como int (o LLM pode
+    # devolver `veiculo_ano`-style inteiro) e perde o zero à esquerda se
+    # convertido ingenuamente pra string -- zero-pad pra 8 dígitos antes.
+    assert normalize_cep(7654321) == "07654-321"
+
+
 def test_normalize_idade_aceita_inteiro_ou_string_numerica():
     assert normalize_idade(35) == 35
     assert normalize_idade("35") == 35
@@ -129,6 +138,61 @@ def test_normalize_idade_a_partir_de_nasci_em_ano():
     esperado = ano_atual - 1989
 
     assert normalize_idade("nasci em 1989") == esperado
+
+
+# ---------------------------------------------------------------------------
+# 3.2 (P2-2) — "nasci em dd/mm/aaaa" (data completa) calcula idade exata;
+# só o ano segue como antes, mas loga warning de ±1 na fronteira 75/76.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_idade_data_completa_calcula_idade_exata_respeitando_mes_dia():
+    hoje = date.today()
+    nascimento = date(1990, 12, 31)  # dia/mês tipicamente ainda não chegado no ano
+    esperado = hoje.year - nascimento.year
+    if (hoje.month, hoje.day) < (nascimento.month, nascimento.day):
+        esperado -= 1
+
+    assert normalize_idade("nasci em 31/12/1990") == esperado
+
+
+def test_normalize_idade_data_completa_aniversario_ja_passado_no_ano():
+    hoje = date.today()
+    nascimento = date(1990, 1, 1)  # dia/mês certamente já passou (exceto em 1º/jan)
+    esperado = hoje.year - nascimento.year
+    if (hoje.month, hoje.day) < (nascimento.month, nascimento.day):
+        esperado -= 1
+
+    assert normalize_idade("nasci em 01/01/1990") == esperado
+
+
+def test_normalize_idade_data_completa_invalida_cai_no_fallback_de_ano():
+    # "31/02" não existe -- não deve derrubar a extração, só ignora o
+    # dia/mês inválidos e segue o comportamento de só-ano.
+    ano_atual = date.today().year
+    esperado = ano_atual - 1990
+
+    assert normalize_idade("nasci em 31/02/1990") == esperado
+
+
+def test_normalize_idade_so_ano_perto_da_fronteira_75_76_loga_warning(caplog):
+    ano_boundary = date.today().year - 75
+
+    with caplog.at_level(logging.WARNING):
+        idade = normalize_idade(f"nasci em {ano_boundary}")
+
+    assert idade == 75
+    assert any("75" in rec.message and "76" in rec.message for rec in caplog.records)
+
+
+def test_normalize_idade_so_ano_longe_da_fronteira_nao_loga_warning(caplog):
+    ano_longe = date.today().year - 30
+
+    with caplog.at_level(logging.WARNING):
+        idade = normalize_idade(f"nasci em {ano_longe}")
+
+    assert idade == 30
+    assert caplog.records == []
 
 
 def test_extract_once_normaliza_nasci_em_do_texto_quando_llm_devolve_frase():
@@ -278,6 +342,52 @@ def test_qualification_session_acumula_dados_entre_turnos():
     assert session.is_complete() is True
 
 
+# ---------------------------------------------------------------------------
+# 2.1 — `intent` fundido na extração (zero chamada extra de LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_once_carrega_intent_do_llm():
+    llm = StubLlmClient({"idade": 40, "intent": "correct"})
+
+    result = extract_once("na verdade tenho 40 anos", llm_client=llm)
+
+    assert result.data.intent == "correct"
+
+
+def test_extract_once_default_intent_quando_llm_nao_devolve_o_campo():
+    # Extração antiga (sem `intent`) ou LLM que não retornou o campo -- nunca
+    # deve quebrar; cai num default neutro.
+    llm = StubLlmClient({"idade": 35})
+
+    result = extract_once("tenho 35 anos", llm_client=llm)
+
+    assert result.data.intent == "other"
+
+
+def test_extract_once_default_intent_sem_llm_client_nenhum():
+    result = extract_once("carro 2013, cep 30130-000", llm_client=None)
+
+    assert result.data.intent == "other"
+
+
+def test_extract_once_normaliza_intent_desconhecido_para_other():
+    llm = StubLlmClient({"intent": "algo_nao_mapeado"})
+
+    result = extract_once("oi", llm_client=llm)
+
+    assert result.data.intent == "other"
+
+
+def test_qualification_session_process_turn_expoe_intent_do_turno_atual():
+    session = QualificationSession(max_attempts=2)
+    llm = StubLlmClient({"idade": 40, "intent": "correct"})
+
+    result = session.process_turn("na verdade tenho 40 anos", llm_client=llm)
+
+    assert result.data.intent == "correct"
+
+
 def test_qualification_session_max_attempts_e_parametrizavel():
     session = QualificationSession(max_attempts=3)
 
@@ -290,3 +400,129 @@ def test_qualification_session_max_attempts_e_parametrizavel():
 
     assert session.attempts == 3
     assert session.needs_handoff() is True
+
+
+# ---------------------------------------------------------------------------
+# 1.2 (P0-1) — `normalize_data_inicio`: ISO ou dd/mm/aaaa válidos -> ISO;
+# datas malformadas/inexistentes -> None (nunca propaga pro payload da /quote).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("2026-03-15", "2026-03-15"),
+        ("15/03/2026", "2026-03-15"),
+        ("01/01/2026", "2026-01-01"),
+    ],
+)
+def test_normalize_data_inicio_aceita_iso_e_dd_mm_aaaa(raw, expected):
+    assert normalize_data_inicio(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "30/02/2026",  # fevereiro não tem dia 30
+        "amanhã",
+        "31/04/2026",  # abril não tem dia 31
+        "2026-02-30",
+        "",
+        None,
+        "não sei",
+    ],
+)
+def test_normalize_data_inicio_invalida_vira_none(raw):
+    assert normalize_data_inicio(raw) is None
+
+
+def test_extract_once_normaliza_data_inicio_invalida_para_none():
+    llm = StubLlmClient(
+        {"idade": 35, "veiculo_ano": 2015, "cep": "01000-000", "data_inicio": "30/02/2026"}
+    )
+
+    result = extract_once("35 anos, carro 2015, cep 01000-000, começa 30/02/2026", llm_client=llm)
+
+    assert result.data.data_inicio is None
+
+
+def test_extract_once_normaliza_data_inicio_dd_mm_aaaa_para_iso():
+    llm = StubLlmClient(
+        {"idade": 35, "veiculo_ano": 2015, "cep": "01000-000", "data_inicio": "15/03/2026"}
+    )
+
+    result = extract_once("35 anos, carro 2015, cep 01000-000, começa 15/03/2026", llm_client=llm)
+
+    assert result.data.data_inicio == "2026-03-15"
+
+
+# ---------------------------------------------------------------------------
+# 2.2 (P1-4) — contradição material entre turnos: idade Δ>15, veiculo_ano
+# Δ>10, CEP com prefixo (2 díg) diferente. Correção pequena/plausível NÃO é
+# contradição (guarda contra falso-positivo, coordena com 1.1).
+# ---------------------------------------------------------------------------
+
+
+def test_process_turn_flags_wild_age_contradiction():
+    session = QualificationSession()
+    session.process_turn("tenho 35 anos", llm_client=StubLlmClient({"idade": 35}))
+
+    result = session.process_turn(
+        "na verdade tenho 90 anos", llm_client=StubLlmClient({"idade": 90})
+    )
+
+    assert result.contradiction is True
+
+
+def test_process_turn_does_not_flag_small_age_correction():
+    session = QualificationSession()
+    session.process_turn("tenho 35 anos", llm_client=StubLlmClient({"idade": 35}))
+
+    result = session.process_turn(
+        "na verdade tenho 40 anos", llm_client=StubLlmClient({"idade": 40})
+    )
+
+    assert result.contradiction is False
+
+
+def test_process_turn_flags_wild_veiculo_ano_contradiction():
+    session = QualificationSession()
+    session.process_turn("carro 2015", llm_client=StubLlmClient({"veiculo_ano": 2015}))
+
+    result = session.process_turn(
+        "na verdade é de 1960", llm_client=StubLlmClient({"veiculo_ano": 1960})
+    )
+
+    assert result.contradiction is True
+
+
+def test_process_turn_does_not_flag_small_veiculo_ano_correction():
+    session = QualificationSession()
+    session.process_turn("carro 2015", llm_client=StubLlmClient({"veiculo_ano": 2015}))
+
+    result = session.process_turn(
+        "na verdade é 2009", llm_client=StubLlmClient({"veiculo_ano": 2009})
+    )
+
+    assert result.contradiction is False
+
+
+def test_process_turn_flags_cep_prefix_contradiction():
+    session = QualificationSession()
+    session.process_turn("cep 26703-384", llm_client=StubLlmClient({"cep": "26703-384"}))
+
+    result = session.process_turn(
+        "na verdade é 01000-000", llm_client=StubLlmClient({"cep": "01000-000"})
+    )
+
+    assert result.contradiction is True
+
+
+def test_process_turn_no_contradiction_on_first_turn():
+    session = QualificationSession()
+
+    result = session.process_turn(
+        "tenho 90 anos", llm_client=StubLlmClient({"idade": 90})
+    )
+
+    assert result.contradiction is False

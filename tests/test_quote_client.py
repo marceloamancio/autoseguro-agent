@@ -3,10 +3,11 @@
 Sem rede real: usa `httpx.MockTransport` com handlers determinísticos (às
 vezes assíncronos, pra simular a chamada lenta sem bloquear o event loop).
 Cobre a política de resiliência do Group B / DEC-7 (Q5):
-- 5xx e timeout/erro de transporte -> retry com backoff; 422/400 -> nunca.
+- 5xx, 429/408 e timeout/erro de transporte -> retry com backoff; 422/400 -> nunca.
 - Chamada lenta > timeout -> tratada como timeout -> retry.
 - Circuit breaker: abre após N falhas seguidas (fast-fail sem bater no
-  endpoint) e fecha sondando /health após o reset.
+  endpoint) e decide fechar/reabrir via canary real no /quote após o reset
+  (nunca sondando /health).
 - Sucesso -> objeto tipado (`QuoteResult`) com os campos da resposta.
 """
 
@@ -179,6 +180,113 @@ async def test_5xx_exhausts_retries_and_raises_quote_unavailable():
     assert "500" in exc_info.value.reason or "esgotou" in exc_info.value.reason
 
 
+# --- 429 / 408: infra retryável (P0-5) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_429_retries_then_succeeds():
+    """429 (rate limit) é transitório -- deve consumir o orçamento de
+    tentativas igual a um 5xx, não desistir na 1a chamada."""
+    counter = CallCounter()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter.record(request)
+        if counter.count("/quote") < 3:
+            return json_response(429, {"error": "rate_limited"})
+        return json_response(200, SUCCESS_BODY)
+
+    client = client_with_handler(make_config(quote_max_retries=3), handler)
+    try:
+        result = await client.cotar(PAYLOAD)
+    finally:
+        await client.aclose()
+
+    assert result.premio_mensal == 119.90
+    assert counter.count("/quote") == 3
+
+
+@pytest.mark.asyncio
+async def test_408_retries_then_succeeds():
+    """408 (request timeout do servidor) é transitório -- mesmo tratamento
+    de 429/5xx."""
+    counter = CallCounter()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter.record(request)
+        if counter.count("/quote") < 3:
+            return json_response(408, {"error": "request_timeout"})
+        return json_response(200, SUCCESS_BODY)
+
+    client = client_with_handler(make_config(quote_max_retries=3), handler)
+    try:
+        result = await client.cotar(PAYLOAD)
+    finally:
+        await client.aclose()
+
+    assert result.premio_mensal == 119.90
+    assert counter.count("/quote") == 3
+
+
+@pytest.mark.asyncio
+async def test_429_exhausts_retries_and_raises_quote_unavailable():
+    counter = CallCounter()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter.record(request)
+        return json_response(429, {"error": "rate_limited"})
+
+    client = client_with_handler(
+        make_config(quote_max_retries=2, quote_cb_failure_threshold=100), handler
+    )
+    try:
+        with pytest.raises(QuoteUnavailable) as exc_info:
+            await client.cotar(PAYLOAD)
+    finally:
+        await client.aclose()
+
+    assert counter.count("/quote") == 3
+    assert exc_info.value.attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_429_honors_retry_after_header():
+    """Quando a resposta 429 traz `Retry-After`, o backoff antes da próxima
+    tentativa deve respeitar esse valor (nunca esperar menos que o pedido
+    pelo servidor)."""
+    counter = CallCounter()
+    delays: list[float] = []
+    last_call_at: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import time as _time
+
+        now = _time.monotonic()
+        if "t" in last_call_at:
+            delays.append(now - last_call_at["t"])
+        last_call_at["t"] = now
+        counter.record(request)
+        if counter.count("/quote") < 2:
+            return httpx.Response(
+                429, headers={"Retry-After": "0.2"}, json={"error": "rate_limited"}
+            )
+        return json_response(200, SUCCESS_BODY)
+
+    client = client_with_handler(
+        make_config(quote_max_retries=1, quote_backoff_base_s=0.01), handler
+    )
+    try:
+        result = await client.cotar(PAYLOAD)
+    finally:
+        await client.aclose()
+
+    assert result.premio_mensal == 119.90
+    assert counter.count("/quote") == 2
+    assert delays and delays[0] >= 0.2, (
+        f"FURO: backoff ({delays[0] if delays else None}s) nao respeitou "
+        "Retry-After (0.2s) do 429"
+    )
+
+
 # --- 422 / 400: sem retry, erro de negócio -------------------------------
 
 
@@ -347,7 +455,10 @@ async def test_circuit_breaker_opens_and_fast_fails_without_hitting_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_closes_after_reset_when_health_probe_ok():
+async def test_circuit_breaker_closes_after_reset_when_quote_canary_succeeds():
+    """P0-7: a sonda de meia-abertura decide pelo /quote real (canary), nunca
+    por /health -- mesmo com /health sempre "ok", o breaker só fecha quando o
+    /quote de verdade responde 200."""
     counter = CallCounter()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -373,28 +484,31 @@ async def test_circuit_breaker_closes_after_reset_when_health_probe_ok():
         # Breaker aberto agora; chamada imediata deve fast-fail sem sondar.
         with pytest.raises(QuoteUnavailable):
             await client.cotar(PAYLOAD)
-        assert counter.count("/health") == 0
+        assert counter.count("/quote") == 2
 
-        # Espera passar o reset_s e tenta de novo: deve sondar /health (ok)
-        # e deixar a chamada real passar, que agora terá sucesso (200).
+        # Espera passar o reset_s e tenta de novo: o canary bate direto no
+        # /quote real (nunca em /health) -- que agora responde 200.
         await asyncio.sleep(0.06)
         result = await client.cotar(PAYLOAD)
 
         assert isinstance(result, QuoteResult)
-        assert counter.count("/health") == 1
+        assert counter.count("/health") == 0
         assert counter.count("/quote") == 3
     finally:
         await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_stays_open_when_health_probe_fails():
+async def test_circuit_breaker_reopens_when_quote_canary_still_fails():
+    """P0-7: com /quote ainda caído, o breaker REABRE mesmo que /health
+    responda 200 -- prova de que a decisão de meia-abertura não depende mais
+    de /health."""
     counter = CallCounter()
 
     def handler(request: httpx.Request) -> httpx.Response:
         counter.record(request)
         if request.url.path == "/health":
-            return json_response(503, {"status": "down"})
+            return json_response(200, {"status": "ok"})  # sempre up, mas irrelevante agora
         return json_response(500, {"error": "upstream_unavailable"})
 
     config = make_config(
@@ -408,11 +522,16 @@ async def test_circuit_breaker_stays_open_when_health_probe_fails():
             await client.cotar(PAYLOAD)  # abre o breaker (threshold=1)
 
         await asyncio.sleep(0.04)
-        with pytest.raises(QuoteUnavailable) as exc_info:
-            await client.cotar(PAYLOAD)  # sonda /health, falha, reabre
+        with pytest.raises(QuoteUnavailable):
+            await client.cotar(PAYLOAD)  # canary bate no /quote (ainda caído), reabre
 
+        assert counter.count("/health") == 0  # nunca sondou /health
+        assert counter.count("/quote") == 2  # 1 abertura + 1 canary
+
+        # Breaker deve ter reaberto: próxima chamada imediata é fast-fail.
+        with pytest.raises(QuoteUnavailable) as exc_info:
+            await client.cotar(PAYLOAD)
         assert exc_info.value.reason == "circuit_breaker_aberto"
-        assert counter.count("/health") == 1
-        assert counter.count("/quote") == 1  # a sonda não bateu em /quote
+        assert counter.count("/quote") == 2  # não incrementou
     finally:
         await client.aclose()

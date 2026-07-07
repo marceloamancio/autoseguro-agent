@@ -55,9 +55,9 @@ def test_loads_with_defaults_when_api_key_present(monkeypatch):
     assert config.anthropic_model == "claude-sonnet-5"
     assert config.quote_api_url == "http://localhost:8000"
     assert config.quote_timeout_s == 9.0
-    assert config.quote_max_retries == 3
+    assert config.quote_max_retries == 2
     assert config.quote_backoff_base_s == 0.5
-    assert config.quote_deadline_s == 25.0
+    assert config.quote_deadline_s == 30.0
     assert config.quote_cb_failure_threshold == 5
     assert config.quote_cb_reset_s == 30.0
 

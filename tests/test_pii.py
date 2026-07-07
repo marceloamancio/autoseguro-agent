@@ -255,3 +255,135 @@ def test_build_sweep_prompt_inclui_categorias_obrigatorias_e_pede_adicionais():
     for category in MANDATORY_CATEGORIES:
         assert category in prompt
     assert "adicional" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# 2.4 (P1-1) — ampliação de recall: formatos plausíveis fora do gerador
+# ---------------------------------------------------------------------------
+
+
+class TestRecallVariantesPlausiveis:
+    def test_cpf_cru_mascarado(self):
+        text = "meu cpf e 12345678901, pode confirmar?"
+        out = redact_text(text)
+        assert "12345678901" not in out
+        assert MARKERS["cpf"] in out
+
+    def test_telefone_parenteses_mascarado(self):
+        text = "pode me ligar no (11) 91234-5678 se precisar"
+        out = redact_text(text)
+        assert "91234-5678" not in out
+        assert MARKERS["telefone"] in out
+
+    def test_telefone_so_digitos_mascarado(self):
+        text = "meu whats é 11912345678"
+        out = redact_text(text)
+        assert "11912345678" not in out
+        assert MARKERS["telefone"] in out
+
+    def test_telefone_fixo_mascarado(self):
+        text = "pode ligar fixo também: (11) 3456-7890"
+        out = redact_text(text)
+        assert "3456-7890" not in out
+        assert MARKERS["telefone"] in out
+
+    def test_placa_antiga_mascarada(self):
+        text = "a placa do carro é ABC1234, é um Gol antigo"
+        out = redact_text(text)
+        assert "ABC1234" not in out
+        assert MARKERS["placa"] in out
+
+    def test_cep_cru_mascarado(self):
+        text = "meu cep é 01310100, moro perto da paulista"
+        out = redact_text(text)
+        assert "01310100" not in out
+        assert MARKERS["cep"] in out
+
+    def test_mensagem_com_todas_as_variantes_planta_do_red_team(self):
+        text = (
+            "cpf 12345678901, telefone (11) 91234-5678, placa ABC1234, "
+            "cep 01310100, fone 11912345678"
+        )
+        out = redact_text(text)
+        assert "12345678901" not in out
+        assert "91234-5678" not in out
+        assert "ABC1234" not in out
+        assert "01310100" not in out
+        assert "11912345678" not in out
+
+    def test_nao_regride_precisao_existente(self):
+        # 3.4 (viés de recall) não pode fazer idade/ano de veículo virarem PII.
+        for text in ("tenho 35 anos", "Toyota Corolla 2008", "nasci em 1989"):
+            assert redact_text(text) == text
+
+
+# ---------------------------------------------------------------------------
+# 2.4 (P1-1) — AnthropicSweepClient: adaptador real (client mockado, sem rede)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSweepMessages:
+    def __init__(self, response):
+        self._response = response
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._response
+
+
+class _FakeSweepClient:
+    def __init__(self, response):
+        self.messages = _FakeSweepMessages(response)
+
+
+def _sweep_text_response(text: str):
+    from types import SimpleNamespace
+
+    block = SimpleNamespace(type="text", text=text)
+    return SimpleNamespace(content=[block])
+
+
+class TestAnthropicSweepClient:
+    def test_chama_api_uma_unica_vez_em_lote_e_realinha_resposta_numerada(self):
+        from autoseguro.pii import AnthropicSweepClient
+
+        resp = _sweep_text_response("1. primeiro texto mascarado\n2. segundo texto mascarado")
+        fake_client = _FakeSweepClient(resp)
+        sweep = AnthropicSweepClient("sk-ant-fake", "claude-sonnet-5", client=fake_client)
+
+        out = sweep(["texto 1 com pii", "texto 2 sem pii"], MANDATORY_CATEGORIES)
+
+        assert len(fake_client.messages.calls) == 1
+        assert out == ["primeiro texto mascarado", "segundo texto mascarado"]
+
+    def test_sem_textos_e_no_op_sem_chamar_a_api(self):
+        from autoseguro.pii import AnthropicSweepClient
+
+        fake_client = _FakeSweepClient(_sweep_text_response(""))
+        sweep = AnthropicSweepClient("sk-ant-fake", "m", client=fake_client)
+
+        assert sweep([], MANDATORY_CATEGORIES) == []
+        assert fake_client.messages.calls == []
+
+    def test_resposta_fora_do_formato_numerado_devolve_textos_originais(self):
+        from autoseguro.pii import AnthropicSweepClient
+
+        resp = _sweep_text_response("resposta livre sem numeração")
+        fake_client = _FakeSweepClient(resp)
+        sweep = AnthropicSweepClient("sk-ant-fake", "m", client=fake_client)
+
+        texts = ["a", "b"]
+        assert sweep(texts, MANDATORY_CATEGORIES) == texts
+
+    def test_pluga_direto_no_pii_redactor(self):
+        from autoseguro.pii import AnthropicSweepClient
+
+        resp = _sweep_text_response("1. ⟨NOME_TERCEIRO⟩ confirma o cpf ⟨CPF⟩")
+        fake_client = _FakeSweepClient(resp)
+        sweep = AnthropicSweepClient("sk-ant-fake", "m", client=fake_client)
+
+        redactor = PiiRedactor(llm_client=sweep)
+        out = redactor.redact_batch(["Fulano de Tal confirma o cpf 389.083.863-43"])
+
+        assert out == ["⟨NOME_TERCEIRO⟩ confirma o cpf ⟨CPF⟩"]

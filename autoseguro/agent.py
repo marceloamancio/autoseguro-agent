@@ -34,7 +34,7 @@ from datetime import date
 from typing import Any, Protocol
 
 from . import handoff
-from .extraction import ExtractedData, LlmExtractorClient, QualificationSession
+from .extraction import ExtractedData, ExtractionResult, LlmExtractorClient, QualificationSession
 from .handoff import FuzzyClassifier, HandoffDecision
 from .quote_client import (
     CotacaoRecusada,
@@ -50,6 +50,36 @@ _CONFIRM_YES_RE = re.compile(
     re.IGNORECASE,
 )
 _CONFIRM_NO_RE = re.compile(r"\b(n[aã]o|errado|incorreto)\b", re.IGNORECASE)
+
+# P1-5: `marca`/`modelo` são campos de rapport de baixo controle (vêm direto
+# do texto do lead, nunca validados) e são ecoados de volta na mensagem de
+# confirmação -- sanitiza antes de ecoar (remove caracteres de controle e
+# marcadores óbvios de instrução/injeção, limita o tamanho). Nomes reais de
+# marca/modelo são curtos; qualquer payload de injeção plausível excede o
+# limite e vem cortado.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_INSTRUCTION_MARKER_RE = re.compile(
+    r"</?system[^>]*>|ignore\s+(todas\s+)?as\s+instru\w*|novo_prompt|"
+    r"instru\w*\s+anteriores",
+    re.IGNORECASE,
+)
+_MAX_FREE_TEXT_FIELD_LEN = 30
+
+
+def _sanitize_free_text_field(value: str | None) -> str | None:
+    """Sanitiza um campo de rapport (marca/modelo) antes de ecoar ao lead."""
+    if not value:
+        return value
+    text = _CONTROL_CHARS_RE.sub("", value)
+    text = _INSTRUCTION_MARKER_RE.sub("", text)
+    text = text.strip()[:_MAX_FREE_TEXT_FIELD_LEN].strip()
+    return text or None
+
+
+def _essential_snapshot(data: ExtractedData) -> tuple[Any, Any, Any]:
+    """Retrato dos 3 campos essenciais -- usado pra detectar mudança real de
+    dado entre turnos (1.1/1.3), independente do sinal de `intent`."""
+    return (data.idade, data.veiculo_ano, data.cep)
 
 # Perguntas que o agente pode fazer para qualificar — de propósito, restritas
 # aos únicos 3 campos essenciais que a `/quote` usa (Q3, minimização: nunca
@@ -150,6 +180,10 @@ class AgentState:
     quote_delivered: bool = False
     handoff: HandoffDecision | None = None
     asked_data_inicio: bool = False
+    # 1.2 (P0-1): último payload que a /quote recusou com 400 -- nunca
+    # reenviado idêntico (ver `_quote_and_reply`).
+    last_invalid_payload: dict[str, Any] | None = None
+    last_invalid_detalhe: str | None = None
 
 
 @dataclass
@@ -185,8 +219,14 @@ def build_missing_fields_question(missing: list[str], *, ask_data_inicio: bool) 
 
 
 def build_confirmation_message(data: ExtractedData) -> str:
-    """Resume o que foi entendido e pede confirmação antes de cotar (DEC-5)."""
-    veiculo_partes = [p for p in (data.marca, data.modelo) if p]
+    """Resume o que foi entendido e pede confirmação antes de cotar (DEC-5).
+
+    `marca`/`modelo` são sanitizados antes de ecoar (P1-5) -- nunca voltam
+    crus, mesmo que carreguem texto de instrução/injeção.
+    """
+    marca = _sanitize_free_text_field(data.marca)
+    modelo = _sanitize_free_text_field(data.modelo)
+    veiculo_partes = [p for p in (marca, modelo) if p]
     veiculo_desc = " ".join([*veiculo_partes, str(data.veiculo_ano)]).strip()
     return (
         f"Só confirmando antes de cotar: você tem {data.idade} anos, "
@@ -243,10 +283,31 @@ def format_refusal(exc: CotacaoRecusada) -> str:
 
 
 def format_payload_invalido(exc: PayloadInvalido) -> str:
-    """Pede o dado faltante/errado apontado pela API (400) — sem handoff."""
+    """Pede o dado faltante/errado apontado pela API (400) — sem handoff.
+
+    Menciona `data_inicio` como possível causa (1.2 / P0-1) -- a data é um
+    campo tão sujeito a erro de formato quanto idade/ano/CEP, mas antes não
+    era citada aqui, então o lead nunca sabia que precisava corrigi-la.
+    """
     return (
         f"Preciso ajustar um dado antes de cotar: {exc.detalhe} Pode "
-        "confirmar de novo sua idade, o ano do veículo e o CEP?"
+        "confirmar de novo sua idade, o ano do veículo, o CEP e a data de "
+        "início (se informou uma, no formato dd/mm/aaaa)?"
+    )
+
+
+def format_payload_invalido_repetido(detalhe: str | None) -> str:
+    """Payload já recusado (400) chegou idêntico de novo (1.2 / P0-1).
+
+    Nunca reenvia o mesmo payload pra `/quote` -- pede especificamente o
+    campo mais provável de estar malformado (`data_inicio`) em vez de repetir
+    a mesma pergunta genérica, que travaria a conversa em loop.
+    """
+    return (
+        "Ainda não consegui fechar a cotação com os dados que você "
+        f"confirmou (motivo: {detalhe or 'dado inválido'}). Pra eu não ficar "
+        "tentando de novo do mesmo jeito: pode me confirmar especificamente "
+        "a data de início que você quer, no formato dd/mm/aaaa?"
     )
 
 
@@ -309,9 +370,10 @@ class Agent:
         """Processa mais um turno da conversa e decide a próxima resposta.
 
         Ordem de avaliação (gatilhos determinísticos primeiro, Q6): handoff
-        já decidido > mídia essencial > pedido explícito de humano >
-        fechamento/emissão > classificador fuzzy > fluxo de
-        qualificação/confirmação/cotação.
+        já decidido > mídia essencial > extração do turno (2.1: já vem com
+        o sinal de `intent`, zero chamada extra de LLM) > escopo/pedido
+        explícito de humano > fechamento/emissão > fluxo de
+        qualificação/confirmação/cotação/re-cotação.
         """
         state = self.state
 
@@ -329,10 +391,25 @@ class Agent:
             state.handoff = decision
             return AgentTurn(reply=decision.message, handoff=decision)
 
-        decision = (
-            handoff.for_explicit_request(user_msg)
-            or handoff.for_policy_issuance(user_msg)
-            or handoff.classify_fuzzy(user_msg, self._fuzzy_classifier)
+        # Extração única do turno (2.1): a MESMA chamada que extrai os dados
+        # de cotação já classifica a intenção -- é o sinal que alimenta
+        # tanto a decisão de escopo abaixo quanto a confirmação/re-cotação
+        # mais adiante (1.1/1.3), sem nenhuma chamada extra de LLM.
+        before_essential = _essential_snapshot(state.session.data)
+        result = state.session.process_turn(user_msg, llm_client=self._extractor)
+        intent = result.data.intent
+        essential_changed = _essential_snapshot(state.session.data) != before_essential
+
+        if result.contradiction:
+            # 2.2 (P1-4): sobrescrita materialmente diferente de um
+            # essencial (ex.: idade 35 -> 90) -- autoridade, não capacidade;
+            # nunca resolvido sozinho (`QualificationSession.process_turn`).
+            decision = handoff.for_contradictory_data(user_msg)
+            state.handoff = decision
+            return AgentTurn(reply=decision.message, handoff=decision)
+
+        decision = handoff.for_policy_issuance(user_msg) or handoff.classify_scope(
+            intent, user_msg, self._fuzzy_classifier
         )
         if decision is not None:
             state.handoff = decision
@@ -343,19 +420,24 @@ class Agent:
             state.plano_id = plano_mencionado
 
         if state.closed or state.quote_delivered:
+            if state.quote_delivered and (intent == "requote" or essential_changed):
+                # 1.3 (P0-3): re-cotar após entrega -- reabre a cotação com
+                # o dado novo em vez de engolir o pedido no papo livre.
+                state.quote_delivered = False
+                state.confirmed = False
+                return await self._quote_and_reply()
             reply = await self._llm_reply(user_msg)
             return AgentTurn(
                 reply=reply or "Fico à disposição se precisar de mais alguma coisa!"
             )
 
         if state.awaiting_confirmation:
-            return await self._handle_confirmation_turn(user_msg)
+            return await self._handle_confirmation_turn(user_msg, result, essential_changed)
 
-        return await self._handle_qualification_turn(user_msg)
+        return await self._handle_qualification_turn(result)
 
-    async def _handle_qualification_turn(self, user_msg: str) -> AgentTurn:
+    async def _handle_qualification_turn(self, result: ExtractionResult) -> AgentTurn:
         state = self.state
-        state.session.process_turn(user_msg, llm_client=self._extractor)
 
         decision = handoff.for_clarify_loop_exhausted(state.session)
         if decision is not None:
@@ -373,17 +455,18 @@ class Agent:
         state.asked_data_inicio = True
         return AgentTurn(reply=question)
 
-    async def _handle_confirmation_turn(self, user_msg: str) -> AgentTurn:
+    async def _handle_confirmation_turn(
+        self, user_msg: str, result: ExtractionResult, essential_changed: bool
+    ) -> AgentTurn:
+        """Confirmação: extrai-então-diferencia (1.1/P0-2).
+
+        A extração (com `intent`) já rodou em `handle_turn`, antes de checar
+        "sim" -- nunca cota com o dado velho quando o "sim" vem com uma
+        correção embutida (`intent == "correct"` ou um essencial mudou de
+        verdade): re-confirma com o dado atualizado em vez de cotar direto.
+        """
         state = self.state
-
-        if _CONFIRM_YES_RE.search(user_msg) and not _CONFIRM_NO_RE.search(user_msg):
-            state.confirmed = True
-            state.awaiting_confirmation = False
-            return await self._quote_and_reply()
-
-        # Não confirmou: trata como correção/dado novo, reprocessa e
-        # re-pergunta a confirmação com os dados atualizados.
-        state.session.process_turn(user_msg, llm_client=self._extractor)
+        intent = result.data.intent
 
         decision = handoff.for_clarify_loop_exhausted(state.session)
         if decision is not None:
@@ -399,6 +482,24 @@ class Agent:
             state.asked_data_inicio = True
             return AgentTurn(reply=question)
 
+        # Correção embutida (sinal de intenção ou dado essencial mudou de
+        # verdade): nunca cota com o valor velho -- re-confirma com o
+        # atualizado em vez de seguir pro "sim" cru (P0-2).
+        if intent == "correct" or essential_changed:
+            return AgentTurn(reply=build_confirmation_message(state.session.data))
+
+        confirmed_clean = intent == "confirm" or (
+            intent not in ("reject", "correct")
+            and _CONFIRM_YES_RE.search(user_msg)
+            and not _CONFIRM_NO_RE.search(user_msg)
+        )
+        if confirmed_clean:
+            state.confirmed = True
+            state.awaiting_confirmation = False
+            return await self._quote_and_reply()
+
+        # Nem confirmação limpa nem correção reconhecida (ex.: "não" puro,
+        # ou intent == "reject"): repete a confirmação com os dados atuais.
         return AgentTurn(reply=build_confirmation_message(state.session.data))
 
     async def _quote_and_reply(self) -> AgentTurn:
@@ -423,6 +524,15 @@ class Agent:
             "data_inicio": data_inicio,
         }
 
+        # 1.2 (P0-1): este EXATO payload já levou 400 antes -- nunca reenvia
+        # igual esperando um resultado diferente (é assim que o loop
+        # infinito acontecia). Pede o campo ofensor em vez de martelar a API.
+        if state.last_invalid_payload == payload:
+            state.awaiting_confirmation = True
+            return AgentTurn(
+                reply=format_payload_invalido_repetido(state.last_invalid_detalhe)
+            )
+
         try:
             quote = await self.call_quote(payload)
         except CotacaoRecusada as exc:
@@ -430,6 +540,8 @@ class Agent:
             return AgentTurn(reply=format_refusal(exc), closed=True)
         except PayloadInvalido as exc:
             state.awaiting_confirmation = True
+            state.last_invalid_payload = payload
+            state.last_invalid_detalhe = exc.detalhe
             return AgentTurn(reply=format_payload_invalido(exc))
         except QuoteUnavailable as exc:
             decision = handoff.for_quote_unavailable(exc)
@@ -441,6 +553,8 @@ class Agent:
             return AgentTurn(reply=decision.message, handoff=decision)
 
         state.quote_delivered = True
+        state.last_invalid_payload = None
+        state.last_invalid_detalhe = None
         explanation = format_quote_explanation(quote, fallback_note=fallback_note)
         return AgentTurn(reply=explanation, quote=quote)
 
