@@ -5,12 +5,14 @@ idade e CEP em texto livre e desorganizado ("e um Sandero 2022", "tenho 35 anos,
 cep 26703-384"). A `/quote` só usa o **ano** do veículo para cotar — marca/modelo
 servem só pra rapport, nunca entram no preço.
 
-Estratégia (DEC-5): extração via **LLM com structured outputs** (cliente
-injetado/mockável — este módulo nunca chama a API real) com **normalização**
-(ano 2/4 dígitos, CEP com/sem hífen, "nasci em AAAA" → idade) e **validação de
-faixas** iguais às da `/quote` (`idade` 0–200, `veiculo_ano` 1950–2100). Quando o
-LLM falha, está indisponível ou devolve campos vazios, um **backstop regex leve**
-tenta pescar ano e CEP diretamente do texto, como rede de segurança.
+Estratégia (DEC-5): a **extração é 100% do LLM** com structured outputs (cliente
+injetado/mockável — este módulo nunca chama a API real). Nenhum regex garimpa o
+texto livre do lead: essa era a origem de bugs (ano pescado de dentro de um
+telefone, PII virando "dado"). O que fica aqui é só **normalização de formato do
+valor que o LLM devolveu** (ano 2→4 dígitos, CEP → `XXXXX-XXX`, data → ISO) e
+**validação de faixas** iguais às da `/quote` (`idade` 0–200, `veiculo_ano`
+1950–2100). A defesa contra alucinação do LLM é a **confirmação explícita com o
+lead antes de cotar** (Group E), não um segundo extrator.
 
 **Dado essencial** para cotar = `idade + veiculo_ano + cep`. A confirmação com o
 lead antes de cotar é responsabilidade do agente (Group E) — aqui só entra a
@@ -59,27 +61,15 @@ _VALID_INTENTS = frozenset(
 )
 _DEFAULT_INTENT = "other"
 
-# Pivô pra desambiguar ano de 2 dígitos: yy <= _PIVOT_2_DIGIT_ANO -> 20xx,
-# senão -> 19xx. Regra comum de calendário (ex.: "08" -> 2008, "97" -> 1997).
-_PIVOT_2_DIGIT_ANO = 68  # ano corrente % 100 seria mais "correto", mas um pivô
-# fixo é mais previsível/testável e cobre a janela útil de veículos (1950-2100).
+# Pivô pra desambiguar ano de 2 dígitos que o LLM devolva (ex.: "08" -> 2008,
+# "97" -> 1997). yy <= _PIVOT_2_DIGIT_ANO -> 20xx, senão -> 19xx. Não garimpa
+# texto: só normaliza o inteiro que o LLM já extraiu.
+_PIVOT_2_DIGIT_ANO = 68
 
-_REGEX_ANO = re.compile(r"\b(19\d{2}|20\d{2})\b")
+# Regex mantidos são só de FORMATAÇÃO do valor que o LLM devolveu (nunca
+# garimpam a mensagem crua do lead): CEP com hífen já ok, dígitos de CEP, e
+# data dd/mm/aaaa -> ISO.
 _REGEX_CEP_COM_HIFEN = re.compile(r"\b\d{5}-\d{3}\b")
-_REGEX_CEP_8_DIGITOS = re.compile(r"\b\d{8}\b")
-# 3.2 (P2-2): data completa de nascimento ("nasci em dd/mm/aaaa") -- checada
-# antes de `_REGEX_NASCI_EM` (só ano) pra calcular a idade exata respeitando
-# mês/dia, em vez do erro sistemático de ±1 que o cálculo só-por-ano produz
-# (grave justo na fronteira 75/76 de recusa).
-_REGEX_NASCI_EM_DATA_COMPLETA = re.compile(
-    r"nasci\w*\s+em\s+(\d{2})/(\d{2})/(\d{4})", re.IGNORECASE
-)
-_REGEX_NASCI_EM = re.compile(r"nasci\w*\s+em\s+(\d{4})", re.IGNORECASE)
-
-# Idades onde o erro de ±1 do cálculo só-por-ano é mais grave: cruzam a
-# fronteira de recusa 75/76 (ver `namastex-fde-challenge` `plans.json`/regra
-# de negócio) -- só nesses valores vale logar o warning (não pra toda idade).
-_IDADE_BOUNDARY_WARNING_VALUES = frozenset({75, 76})
 _REGEX_DIGITS_ONLY = re.compile(r"\D+")
 _REGEX_DATA_BR = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 
@@ -164,7 +154,7 @@ def normalize_cep(raw: str | int | None) -> str | None:
 
     `int` (3.1 / P2-1): zero-pad para 8 dígitos (`f"{raw:08d}"`) antes de
     seguir o fluxo normal -- um CEP de alto risco começando com "0" (ex.:
-    07654-321, região de São Paulo) chega do LLM/backstop como `int` sem o
+    07654-321, região de São Paulo) chega do LLM como `int` sem o
     zero à esquerda (`7654321`); convertê-lo direto pra string perderia esse
     zero e o CEP viraria "faltante" (8 dígitos exigidos) sem nenhum aviso.
     """
@@ -182,71 +172,21 @@ def normalize_cep(raw: str | int | None) -> str | None:
     return f"{digits[:5]}-{digits[5:]}"
 
 
-def _age_from_birthdate(birth: date, today: date) -> int:
-    """Idade exata em `today`, respeitando se o aniversário do ano já passou."""
-    age = today.year - birth.year
-    if (today.month, today.day) < (birth.month, birth.day):
-        age -= 1
-    return age
-
-
-def _idade_so_por_ano(birth_year: int) -> int:
-    """Cálculo aproximado de sempre (`date.today().year - birth_year`), com
-    warning (3.2 / P2-2) quando o resultado cai na fronteira 75/76."""
-    idade = date.today().year - birth_year
-    if idade in _IDADE_BOUNDARY_WARNING_VALUES:
-        logger.warning(
-            "normalize_idade: idade %s calculada só a partir do ano de "
-            "nascimento (%s), sem mês/dia -- erro de ±1 possível bem na "
-            "fronteira 75/76 de recusa por idade",
-            idade,
-            birth_year,
-        )
-    return idade
-
-
 def normalize_idade(raw: int | str | None) -> int | None:
-    """Normaliza idade a partir de um inteiro, string numérica ou frase.
+    """Normaliza a idade que o LLM devolveu para um inteiro.
 
-    Reconhece dois padrões (3.2 / P2-2):
-
-    - **Data completa** ("nasci em dd/mm/aaaa"): calcula a idade **exata**,
-      respeitando se o aniversário deste ano já passou (`_age_from_birthdate`)
-      -- corrige o erro sistemático de ±1 do cálculo só-por-ano. Data
-      inexistente (ex.: "31/02/1990") não derruba a extração: cai no
-      fallback abaixo (só ano).
-    - **Só o ano** ("nasci em aaaa"): segue o cálculo aproximado de sempre
-      (`date.today().year - aaaa`), mas **loga um warning** quando a idade
-      resultante cai na fronteira 75/76 (`_IDADE_BOUNDARY_WARNING_VALUES`) --
-      é justo aí que o erro de ±1 pode empurrar o lead pro lado errado da
-      regra de recusa por idade.
-
-    Não valida faixa aqui — ver `extract_once`.
+    O `EXTRACT_TOOL` pede `idade` como inteiro (o LLM já resolve "nasci em
+    1989", "tenho trinta e cinco" etc. e devolve o número). Aqui só coeragimos
+    o valor do LLM para `int`; **não** interpretamos frase nenhuma por regex --
+    interpretar linguagem natural é trabalho do LLM, não de um regex frágil que
+    quebra em adversarial. Não valida faixa aqui -- ver `extract_once`.
     """
     if raw is None:
         return None
     if isinstance(raw, int):
         return raw
-
-    text = str(raw).strip()
-
-    full_date_match = _REGEX_NASCI_EM_DATA_COMPLETA.search(text)
-    if full_date_match:
-        dd, mm, yyyy = (int(g) for g in full_date_match.groups())
-        try:
-            birth = date(yyyy, mm, dd)
-        except ValueError:
-            # Data inexistente (ex.: 31/02) -- não derruba a extração, cai no
-            # fallback de só-ano (mesmo warning de fronteira se aplicável).
-            return _idade_so_por_ano(yyyy)
-        return _age_from_birthdate(birth, date.today())
-
-    match = _REGEX_NASCI_EM.search(text)
-    if match:
-        return _idade_so_por_ano(int(match.group(1)))
-
     try:
-        return int(text)
+        return int(str(raw).strip())
     except ValueError:
         return None
 
@@ -294,68 +234,6 @@ def normalize_data_inicio(raw: str | None) -> str | None:
         return None
 
 
-def _distinct_literal_years(text: str) -> list[int]:
-    """Anos de 4 dígitos (19xx/20xx) distintos escritos explicitamente no texto.
-
-    Base do cross-check do L3: quando o lead DIGITA um ano, esse literal é mais
-    confiável que a inferência do LLM para `veiculo_ano` (campo que muda o
-    preço). A deduplicação evita tratar "2020 ... 2020" como ambíguo.
-    """
-    seen: list[int] = []
-    for match in _REGEX_ANO.finditer(text):
-        year = int(match.group(1))
-        if year not in seen:
-            seen.append(year)
-    return seen
-
-
-def _reconcile_ano_with_text(
-    veiculo_ano: int | None, text: str, warnings: list[str]
-) -> int | None:
-    """L3: o ano literal no texto vence o do LLM quando eles divergem.
-
-    Só age quando o texto traz **exatamente um** ano válido (1950-2100) e ele
-    difere do que o LLM devolveu -- aí troca pelo literal e registra o aviso.
-    Vários anos no texto (ex.: troca de carro) são ambíguos: defere ao NLU do
-    LLM. Literal fora da faixa da /quote nunca sobrepõe um valor válido do LLM.
-    """
-    literal_years = _distinct_literal_years(text)
-    if len(literal_years) != 1:
-        return veiculo_ano
-    literal = literal_years[0]
-    if not (VEICULO_ANO_MIN <= literal <= VEICULO_ANO_MAX):
-        return veiculo_ano
-    if veiculo_ano is not None and veiculo_ano != literal:
-        warnings.append(
-            f"veiculo_ano do LLM ({veiculo_ano}) diverge do ano literal no "
-            f"texto ({literal}); usando o literal (campo que muda o preço)"
-        )
-        return literal
-    return veiculo_ano
-
-
-def backstop_extract(text: str) -> dict[str, Any]:
-    """Rede de segurança via regex leve: ano (19xx/20xx) e CEP direto do texto.
-
-    Usado quando o cliente LLM não está disponível, levanta exceção, ou devolve
-    campos vazios para ano/CEP. Não tenta capturar `idade`/marca/modelo — esses
-    dependem demais de contexto pra um regex leve ser confiável.
-    """
-    result: dict[str, Any] = {}
-
-    ano_match = _REGEX_ANO.search(text)
-    if ano_match:
-        result["veiculo_ano"] = int(ano_match.group(1))
-
-    cep_match = _REGEX_CEP_COM_HIFEN.search(text) or _REGEX_CEP_8_DIGITOS.search(text)
-    if cep_match:
-        normalized = normalize_cep(cep_match.group(0))
-        if normalized:
-            result["cep"] = normalized
-
-    return result
-
-
 def _is_contradictory(field_name: str, old_value: Any, new_value: Any) -> bool:
     """Sobrescrita materialmente diferente de um essencial (2.2 / P1-4).
 
@@ -387,16 +265,19 @@ def extract_once(
     text: str,
     llm_client: LlmExtractorClient | None = None,
 ) -> ExtractionResult:
-    """Extrai dados de uma única mensagem/turno do lead.
+    """Extrai dados de uma única mensagem/turno do lead — 100% via LLM.
 
     Fluxo:
-    1. Tenta o `llm_client.extract(text)` (structured output); qualquer
-       exceção ou retorno vazio é tratado como "LLM não ajudou" — sem
-       propagar erro pro caller.
-    2. Normaliza os campos essenciais (`veiculo_ano`, `idade`, `cep`) e valida
-       as faixas da `/quote`; valores fora da faixa viram `None` com um aviso
-       em `warnings` (nunca derrubam a extração dos demais campos).
-    3. Preenche `veiculo_ano`/`cep` ainda ausentes com o backstop regex.
+    1. Chama `llm_client.extract(text)` (structured output). O LLM é o único
+       extrator: nenhum regex garimpa a mensagem crua (isso quebrava em
+       adversarial -- ex.: pescar um "ano" de dentro de um telefone).
+    2. Normaliza o **formato** do que o LLM devolveu (ano 2→4 díg, CEP, data)
+       e valida as faixas da `/quote`; valores fora da faixa viram `None` com
+       um aviso em `warnings` (nunca derrubam a extração dos demais campos).
+
+    Sem `llm_client` (ou se ele levantar exceção) nada é extraído -- o caso de
+    LLM indisponível está fora do escopo do desafio; a robustez contra
+    alucinação vem da confirmação com o lead antes de cotar (Group E).
     """
     raw: dict[str, Any] = {}
     llm_used = False
@@ -414,17 +295,6 @@ def extract_once(
     veiculo_ano = normalize_ano(raw.get("veiculo_ano"))
     idade = normalize_idade(raw.get("idade"))
     cep = normalize_cep(raw.get("cep"))
-
-    # Backstop regex: só entra em ação pros campos que o LLM não trouxe.
-    if veiculo_ano is None or cep is None:
-        backstop = backstop_extract(text)
-        if veiculo_ano is None and "veiculo_ano" in backstop:
-            veiculo_ano = backstop["veiculo_ano"]
-        if cep is None and "cep" in backstop:
-            cep = backstop["cep"]
-
-    # L3: ano literal no texto é autoritativo sobre a inferência do LLM.
-    veiculo_ano = _reconcile_ano_with_text(veiculo_ano, text, warnings)
 
     validated_ano = _validate_range(veiculo_ano, VEICULO_ANO_MIN, VEICULO_ANO_MAX)
     if veiculo_ano is not None and validated_ano is None:
