@@ -16,15 +16,24 @@ transborda o atendimento com um motivo auditável em vez de travar ou inventar p
 
 ## Como rodar
 
-Pré-requisitos: Python 3.11+, [`uv`](https://docs.astral.sh/uv/), Docker (pra subir a API de
-cotação) e uma chave da Anthropic.
+Pré-requisitos: Python 3.11+, [`uv`](https://docs.astral.sh/uv/) e uma chave da Anthropic.
+Docker é **opcional** (só se quiser subir a `/quote` ou o agente por ele — há caminho sem Docker).
 
 ### 1. Suba a API de cotação do desafio
 
-Num checkout do repo `namastex-fde-challenge` (irmão deste, não faz parte deste repo):
+O `namastex-fde-challenge` é um repo **irmão deste** — **não faz parte deste repositório**;
+é fornecido pela Namastex no desafio. **Sem Docker** (mais simples):
 
 ```bash
-docker compose up --build      # API em http://localhost:8000
+cd namastex-fde-challenge/quote-service
+uv run uvicorn app.main:app --port 8000     # API em http://localhost:8000
+```
+
+Ou **com Docker**:
+
+```bash
+cd namastex-fde-challenge
+docker compose up --build                   # API em http://localhost:8000
 ```
 
 ### 2. Configure o ambiente
@@ -67,6 +76,31 @@ uv run pytest
 Todos os 136 testes rodam **sem chave e sem rede** — LLM e `QuoteClient` são sempre
 dublês/mocks nos testes (ver `Protocol`s injetáveis em `agent.py`/`extraction.py`/
 `quote_client.py`).
+
+### Atalhos (Makefile)
+
+```bash
+make help           # lista os comandos
+make install        # uv sync
+make test           # roda os testes
+make quote-service  # sobe a /quote do desafio sem Docker (:8000)
+make run            # roda o agente (CLI)
+```
+
+### Rodar o agente em Docker (opcional)
+
+A imagem containeriza **só o agente** (CLI). A chave e a URL vão por ambiente — nunca
+cozidas na imagem:
+
+```bash
+make docker-build          # ou: docker build -t autoseguro-agent .
+docker run -it --rm \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e QUOTE_API_URL=http://host.docker.internal:8000 \
+  autoseguro-agent
+```
+
+A `/quote` roda no host; `host.docker.internal` deixa o container alcançá-la.
 
 ---
 

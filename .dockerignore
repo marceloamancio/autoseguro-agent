@@ -1,0 +1,21 @@
+# A imagem só precisa de autoseguro/ — o resto fica fora.
+.git
+.github
+.genie
+tests
+docs
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+logs
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
