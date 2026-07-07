@@ -1,33 +1,97 @@
-# Segredos — NUNCA commitar (o avaliador usa a chave dele)
+# ==============================================================================
+# Segredos — NUNCA commitar (o avaliador usa a própria chave)
+# ==============================================================================
 .env
 .env.*
 !.env.example
 *.key
 *.pem
+*.p12
+*.pfx
 secrets/
+credentials.json
+.secrets/
 
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-.uv/
-build/
-dist/
-
-# Testes / cobertura
-.pytest_cache/
-.coverage
-htmlcov/
-.mypy_cache/
-.ruff_cache/
-
-# Logs de execução (podem conter PII/chave — só commitamos logs curados/mascarados)
+# ==============================================================================
+# Logs / traces de execução (podem conter PII/chave — só entregamos logs
+# curados e mascarados em docs/)
+# ==============================================================================
 logs/
 *.log
 
-# SO / editor
+# ==============================================================================
+# Python
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+MANIFEST
+
+# Ambientes virtuais
+.venv/
+.venv*/
+venv/
+env/
+ENV/
+.python-version
+
+# Gerenciadores de pacote
+.uv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==============================================================================
+# Testes / cobertura / type-checking
+# ==============================================================================
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ==============================================================================
+# Jupyter
+# ==============================================================================
+.ipynb_checkpoints/
+
+# ==============================================================================
+# Sistema operacional
+# ==============================================================================
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==============================================================================
+# Editores / IDEs
+# ==============================================================================
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
