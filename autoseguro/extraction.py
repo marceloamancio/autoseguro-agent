@@ -294,6 +294,46 @@ def normalize_data_inicio(raw: str | None) -> str | None:
         return None
 
 
+def _distinct_literal_years(text: str) -> list[int]:
+    """Anos de 4 dígitos (19xx/20xx) distintos escritos explicitamente no texto.
+
+    Base do cross-check do L3: quando o lead DIGITA um ano, esse literal é mais
+    confiável que a inferência do LLM para `veiculo_ano` (campo que muda o
+    preço). A deduplicação evita tratar "2020 ... 2020" como ambíguo.
+    """
+    seen: list[int] = []
+    for match in _REGEX_ANO.finditer(text):
+        year = int(match.group(1))
+        if year not in seen:
+            seen.append(year)
+    return seen
+
+
+def _reconcile_ano_with_text(
+    veiculo_ano: int | None, text: str, warnings: list[str]
+) -> int | None:
+    """L3: o ano literal no texto vence o do LLM quando eles divergem.
+
+    Só age quando o texto traz **exatamente um** ano válido (1950-2100) e ele
+    difere do que o LLM devolveu -- aí troca pelo literal e registra o aviso.
+    Vários anos no texto (ex.: troca de carro) são ambíguos: defere ao NLU do
+    LLM. Literal fora da faixa da /quote nunca sobrepõe um valor válido do LLM.
+    """
+    literal_years = _distinct_literal_years(text)
+    if len(literal_years) != 1:
+        return veiculo_ano
+    literal = literal_years[0]
+    if not (VEICULO_ANO_MIN <= literal <= VEICULO_ANO_MAX):
+        return veiculo_ano
+    if veiculo_ano is not None and veiculo_ano != literal:
+        warnings.append(
+            f"veiculo_ano do LLM ({veiculo_ano}) diverge do ano literal no "
+            f"texto ({literal}); usando o literal (campo que muda o preço)"
+        )
+        return literal
+    return veiculo_ano
+
+
 def backstop_extract(text: str) -> dict[str, Any]:
     """Rede de segurança via regex leve: ano (19xx/20xx) e CEP direto do texto.
 
@@ -383,6 +423,9 @@ def extract_once(
         if cep is None and "cep" in backstop:
             cep = backstop["cep"]
 
+    # L3: ano literal no texto é autoritativo sobre a inferência do LLM.
+    veiculo_ano = _reconcile_ano_with_text(veiculo_ano, text, warnings)
+
     validated_ano = _validate_range(veiculo_ano, VEICULO_ANO_MIN, VEICULO_ANO_MAX)
     if veiculo_ano is not None and validated_ano is None:
         warnings.append(
@@ -410,14 +453,20 @@ def extract_once(
 class QualificationSession:
     """Acumula dados extraídos ao longo de vários turnos de conversa.
 
-    Cada `process_turn` conta como uma tentativa de qualificação. Quando o
-    número de tentativas atinge `max_attempts` (default `N=2`, DEC-5) e ainda
-    falta dado essencial, `needs_handoff()` sinaliza que o agente deve
+    `attempts` conta **todo** turno processado (telemetria). O que decide
+    handoff é `stalled_turns`: turnos **consecutivos sem progresso** (nenhum
+    essencial novo -- `idade`/`veiculo_ano`/`cep` -- capturado). Um lead
+    cooperativo que dá 1 dado essencial por turno nunca estoura, mesmo que
+    leve mais turnos que `max_attempts` pra terminar (bug L1: contar
+    tentativas totais penalizava progresso lento, não falta de cooperação).
+    Quando `stalled_turns` atinge `max_attempts` (default `N=2`, DEC-5) e
+    ainda falta dado essencial, `needs_handoff()` sinaliza que o agente deve
     transbordar em vez de insistir indefinidamente (ver Group E / handoff).
     """
 
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     attempts: int = 0
+    stalled_turns: int = 0
     data: ExtractedData = field(default_factory=ExtractedData)
     warnings: list[str] = field(default_factory=list)
 
@@ -430,8 +479,13 @@ class QualificationSession:
 
         Campos já conhecidos de turnos anteriores são preservados quando o
         turno atual não traz um valor novo (não-`None`) para eles.
+
+        Progresso (novo essencial capturado neste turno) zera
+        `stalled_turns`; sem progresso, incrementa -- é esse contador de
+        estagnação (não `attempts`) que alimenta `needs_handoff()`.
         """
         self.attempts += 1
+        before_missing = set(self.data.essential_missing())
         result = extract_once(text, llm_client=llm_client)
 
         contradiction = False
@@ -443,6 +497,12 @@ class QualificationSession:
                 ):
                     contradiction = True
                 setattr(self.data, f, new_value)
+
+        after_missing = set(self.data.essential_missing())
+        if before_missing - after_missing:
+            self.stalled_turns = 0
+        else:
+            self.stalled_turns += 1
 
         self.warnings.extend(result.warnings)
         result.contradiction = contradiction
@@ -457,5 +517,6 @@ class QualificationSession:
         return self.data.has_essential()
 
     def needs_handoff(self) -> bool:
-        """True quando o limite de tentativas foi atingido sem dado essencial."""
-        return self.attempts >= self.max_attempts and not self.is_complete()
+        """True quando `stalled_turns` consecutivos sem progresso atingiu o
+        limite e ainda falta dado essencial."""
+        return self.stalled_turns >= self.max_attempts and not self.is_complete()

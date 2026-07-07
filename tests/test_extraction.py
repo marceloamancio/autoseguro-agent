@@ -277,6 +277,61 @@ def test_faixas_validas_no_limite_sao_aceitas():
 
 
 # ---------------------------------------------------------------------------
+# L3 (2ª rodada) — ano literal no texto é autoritativo sobre o do LLM.
+#
+# `veiculo_ano` muda o preço; um número de 4 dígitos que o lead DIGITOU é mais
+# confiável que a inferência não-determinística do LLM. O run ao vivo pegou
+# "Compass 2020" ser extraído como 2026 (ano corrente) e cotar o carro errado.
+# Quando o texto traz exatamente UM ano válido e o LLM diverge, vence o literal.
+# ---------------------------------------------------------------------------
+
+
+def test_l3_ano_literal_no_texto_sobrepoe_ano_divergente_do_llm():
+    # LLM alucina 2026 (ano corrente) a partir de "Compass 2020".
+    llm = StubLlmClient({"veiculo_ano": 2026, "idade": 35, "cep": "26703-384"})
+
+    result = extract_once(
+        "Jeep Compass 2020, tenho 35 anos, cep 26703-384", llm_client=llm
+    )
+
+    assert result.data.veiculo_ano == 2020
+    assert any("2020" in w and "2026" in w for w in result.warnings)
+
+
+def test_l3_sem_override_quando_llm_concorda_com_ano_literal():
+    llm = StubLlmClient({"veiculo_ano": 2020, "idade": 35, "cep": "26703-384"})
+
+    result = extract_once("Compass 2020, 35 anos, cep 26703-384", llm_client=llm)
+
+    assert result.data.veiculo_ano == 2020
+    # Sem divergência: nenhum aviso sobre o ano do veículo.
+    assert not any("veiculo_ano" in w or "literal" in w for w in result.warnings)
+
+
+def test_l3_multiplos_anos_no_texto_defere_ao_llm():
+    # Dois anos distintos no texto (troca de carro) -> ambíguo; o NLU do LLM
+    # decide qual é o veículo atual, sem override determinístico.
+    llm = StubLlmClient({"veiculo_ano": 2022, "idade": 40, "cep": "26703-384"})
+
+    result = extract_once(
+        "meu antigo era 2015, agora tenho um 2022, 40 anos, cep 26703-384",
+        llm_client=llm,
+    )
+
+    assert result.data.veiculo_ano == 2022
+
+
+def test_l3_ano_literal_fora_da_faixa_nao_sobrepoe_llm_valido():
+    # Literal 1901 casa o regex mas está fora da faixa da /quote (1950-2100);
+    # não faz sentido sobrepor um valor válido do LLM por um inutilizável.
+    llm = StubLlmClient({"veiculo_ano": 2020, "idade": 30, "cep": "26703-384"})
+
+    result = extract_once("carro 1901, 30 anos, cep 26703-384", llm_client=llm)
+
+    assert result.data.veiculo_ano == 2020
+
+
+# ---------------------------------------------------------------------------
 # Dado essencial (idade + veiculo_ano + cep) e handoff após N=2 tentativas
 # ---------------------------------------------------------------------------
 
@@ -400,6 +455,91 @@ def test_qualification_session_max_attempts_e_parametrizavel():
 
     assert session.attempts == 3
     assert session.needs_handoff() is True
+
+
+# ---------------------------------------------------------------------------
+# Bug L1 (regressão) — clarify-loop não pode transbordar um lead cooperativo
+# que dá os dados essenciais aos poucos (1 por turno): só conta como
+# "tentativa" pra fins de handoff um turno SEM progresso (nenhum essencial
+# novo capturado). `attempts` continua contando todo turno (telemetria);
+# `needs_handoff()` passa a se basear em turnos consecutivos sem progresso.
+# ---------------------------------------------------------------------------
+
+
+class SequencedLlmClient:
+    """Dublê que devolve uma resposta diferente a cada chamada -- simula o
+    lead dando um dado essencial por turno, em vez de tudo de uma vez."""
+
+    def __init__(self, responses: list[dict]):
+        self._responses = responses
+        self._idx = 0
+        self.calls: list[str] = []
+
+    def extract(self, text: str) -> dict:
+        self.calls.append(text)
+        r = self._responses[min(self._idx, len(self._responses) - 1)]
+        self._idx += 1
+        return r
+
+
+def test_lead_cooperativo_dando_1_essencial_por_turno_nunca_transborda():
+    llm = SequencedLlmClient(
+        [
+            {"idade": 42},
+            {"veiculo_ano": 2015},
+            {"cep": "26703-384"},
+        ]
+    )
+    session = QualificationSession(max_attempts=2)
+
+    session.process_turn("tenho 42 anos", llm_client=llm)
+    assert session.needs_handoff() is False
+
+    session.process_turn("meu carro é 2015", llm_client=llm)
+    assert session.needs_handoff() is False
+
+    session.process_turn("cep 26703-384", llm_client=llm)
+    assert session.is_complete() is True
+    assert session.needs_handoff() is False
+
+
+def test_lead_sem_progresso_por_2_turnos_consecutivos_ainda_transborda():
+    # Comportamento preservado (Q6): quem realmente não coopera ainda deve
+    # disparar handoff após N=2 tentativas consecutivas sem nenhum progresso.
+    session = QualificationSession(max_attempts=2)
+
+    session.process_turn("oi, quero um seguro", llm_client=None)
+    assert session.needs_handoff() is False
+
+    session.process_turn("nao sei bem os dados", llm_client=None)
+
+    assert session.needs_handoff() is True
+    assert session.is_complete() is False
+
+
+def test_progresso_intercalado_com_estagnacao_zera_o_contador():
+    # 1 essencial, depois 1 turno sem nada (não deveria bastar sozinho pra
+    # transbordar, pois o contador de estagnação foi resetado no turno
+    # anterior), depois outro essencial -- nunca deve transbordar.
+    llm = SequencedLlmClient(
+        [
+            {"idade": 42},
+            {},
+            {"veiculo_ano": 2015},
+            {"cep": "26703-384"},
+        ]
+    )
+    session = QualificationSession(max_attempts=2)
+
+    session.process_turn("tenho 42 anos", llm_client=llm)
+    session.process_turn("hmm deixa eu ver", llm_client=llm)
+    assert session.needs_handoff() is False
+
+    session.process_turn("meu carro é 2015", llm_client=llm)
+    session.process_turn("cep 26703-384", llm_client=llm)
+
+    assert session.is_complete() is True
+    assert session.needs_handoff() is False
 
 
 # ---------------------------------------------------------------------------

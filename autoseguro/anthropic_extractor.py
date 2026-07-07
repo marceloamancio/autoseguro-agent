@@ -43,7 +43,14 @@ EXTRACT_TOOL: dict[str, Any] = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "veiculo_ano": {"type": ["integer", "null"], "description": "Ano do veículo, ex.: 2008"},
+            "veiculo_ano": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Ano do veículo, ex.: 2008. Copie EXATAMENTE o ano de 4 "
+                    "dígitos que o lead escreveu; nunca substitua pelo ano "
+                    "atual nem arredonde."
+                ),
+            },
             "idade": {"type": ["integer", "null"], "description": "Idade do lead em anos"},
             "cep": {"type": ["string", "null"], "description": "CEP informado pelo lead"},
             "marca": {"type": ["string", "null"], "description": "Marca do veículo"},
@@ -60,8 +67,12 @@ EXTRACT_TOOL: dict[str, Any] = {
                     "informado), reject (negou os dados apresentados), "
                     "requote (pede pra cotar de novo, já com cotação "
                     "entregue), out_of_scope (assunto fora de venda de "
-                    "seguro de veículo, ex.: sinistro/boleto/cancelamento), "
-                    "complaint (reclamação/conflito/ameaça), explicit_human "
+                    "seguro de veículo, ex.: sinistro/boleto/cancelamento -- "
+                    "NUNCA use out_of_scope para uma pergunta sobre o "
+                    "PRÓPRIO seguro que acabou de ser cotado, ex.: franquia, "
+                    "cobertura, carência, apólice, prêmio, mensalidade, "
+                    "vigência -- isso é provide_data/other, está dentro do "
+                    "escopo), complaint (reclamação/conflito/ameaça), explicit_human "
                     "(pediu explicitamente falar com um humano/atendente), "
                     "provide_data (só está informando dados de cotação), "
                     "other (nenhuma das anteriores)."
