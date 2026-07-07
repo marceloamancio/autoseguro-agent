@@ -19,27 +19,43 @@ de execução completa" (ids + status por mensagem/cotação).
   montados (com `llm`/`quote_client` mockáveis em teste); em produção,
   `build_agent_from_config` monta a partir de `Config` (SDK real da
   Anthropic + `QuoteClient` real).
+- **Log entregue/curado (2.4, P1-1):** `trace.jsonl` (hot path, por-evento)
+  só passa pelo regex simples (`Tracer`/`PiiRedactor.redact_record`) — nunca
+  a varredura LLM, que é cara/lenta demais pra rodar por mensagem. O log de
+  execução **entregue** (`cure_delivered_log`) é uma etapa **em lote**, fora
+  do hot-path, que roda depois que a conversa encerra: pega os eventos já
+  mascarados pelo regex e passa **todos os textos de uma vez** por
+  `PiiRedactor.redact_batch` (regex de novo, idempotente, + a varredura LLM
+  em lote, via `AnthropicSweepClient` em produção). `main()` grava o
+  resultado em `DELIVERED_LOG_FILENAME`, ao lado de `trace.jsonl`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Sequence
 
 from .agent import Agent
 from .config import Config, ConfigError, load_config
 from .extraction import LlmExtractorClient, QualificationSession
 from .handoff import FuzzyClassifier, HandoffReason
+from .pii import LlmSweepClient, PiiRedactor
 from .quote_client import QuoteClient
-from .tracing import Tracer
+from .tracing import DEFAULT_TEXT_FIELDS, Tracer
 
 ACK_MESSAGE = "Deixa eu calcular sua cotação, só um instante..."
 NUDGE_MESSAGE = "Ainda estou calculando sua cotação, só mais um instante..."
 NUDGE_AFTER_S = 5.0
 
 EXIT_WORDS: tuple[str, ...] = ("sair", "exit", "quit")
+
+# 2.4 (P1-1): nome do arquivo do log de execução entregue/curado (em lote,
+# fora do hot-path) -- irmão de `trace.jsonl`, mesmo `DEFAULT_LOG_DIR`.
+DELIVERED_LOG_FILENAME = "delivered.jsonl"
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
@@ -117,6 +133,52 @@ def build_agent_from_config(
         fuzzy_classifier=fuzzy_classifier,
         model=config.anthropic_model,
     )
+
+
+def cure_delivered_log(
+    events: Sequence[dict[str, Any]],
+    *,
+    llm_client: LlmSweepClient | None = None,
+    text_fields: Sequence[str] = DEFAULT_TEXT_FIELDS,
+) -> list[dict[str, Any]]:
+    """Cura o log de execução entregue: varredura LLM em **lote**, fora do
+    hot-path (2.4, P1-1).
+
+    Recebe os eventos já emitidos pelo `Tracer` (mascarados pelo regex
+    simples, camada 1, por-evento) e passa **todos os textos configurados de
+    uma vez** por `PiiRedactor.redact_batch` -- uma única chamada em lote
+    (`llm_client` é o `AnthropicSweepClient` em produção; um dublê/`None` em
+    teste). Nunca muta `events`; devolve cópias com os campos de texto
+    substituídos pelo resultado da varredura.
+
+    Sem `llm_client`, `redact_batch` reduz-se ao regex (idempotente sobre
+    texto já mascarado) -- ou seja, é seguro chamar mesmo quando a varredura
+    LLM está desligada.
+    """
+    positions: list[tuple[int, str]] = []
+    texts: list[str] = []
+    for i, event in enumerate(events):
+        for field_name in text_fields:
+            value = event.get(field_name)
+            if isinstance(value, str):
+                positions.append((i, field_name))
+                texts.append(value)
+
+    redactor = PiiRedactor(llm_client=llm_client)
+    swept = redactor.redact_batch(texts)
+
+    cured = [dict(event) for event in events]
+    for (i, field_name), new_value in zip(positions, swept):
+        cured[i][field_name] = new_value
+    return cured
+
+
+def write_jsonl(path: Path, events: Sequence[dict[str, Any]]) -> None:
+    """Grava `events` como JSON Lines em `path` (mesmo formato de `trace.jsonl`)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for event in events:
+            f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 async def _run_turn_with_ack_and_nudge(
@@ -237,6 +299,16 @@ def main() -> None:
         asyncio.run(run_repl(agent, tracer))
     finally:
         tracer.close()
+
+    # 2.4 (P1-1): cura o log de execução entregue em lote, fora do hot-path --
+    # a varredura LLM real (`AnthropicSweepClient`) só roda aqui, nunca por
+    # mensagem durante a conversa (import lazy, mesmo padrão de
+    # `build_agent_from_config`/`AnthropicExtractor`).
+    from .pii import AnthropicSweepClient
+
+    sweep_client = AnthropicSweepClient(config.anthropic_api_key, config.anthropic_model)
+    delivered = cure_delivered_log(tracer.events, llm_client=sweep_client)
+    write_jsonl(tracer.path.parent / DELIVERED_LOG_FILENAME, delivered)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ Nenhum teste chama a API real da Anthropic — o "cliente LLM" é sempre um dubl
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pytest
@@ -120,6 +121,13 @@ def test_normalize_cep_invalido_retorna_none():
     assert normalize_cep("123") is None
 
 
+def test_normalize_cep_aceita_int_preservando_zero_a_esquerda():
+    # 3.1 (P2-1): CEP de alto risco (07xxx-xxx) chega como int (o LLM pode
+    # devolver `veiculo_ano`-style inteiro) e perde o zero à esquerda se
+    # convertido ingenuamente pra string -- zero-pad pra 8 dígitos antes.
+    assert normalize_cep(7654321) == "07654-321"
+
+
 def test_normalize_idade_aceita_inteiro_ou_string_numerica():
     assert normalize_idade(35) == 35
     assert normalize_idade("35") == 35
@@ -130,6 +138,61 @@ def test_normalize_idade_a_partir_de_nasci_em_ano():
     esperado = ano_atual - 1989
 
     assert normalize_idade("nasci em 1989") == esperado
+
+
+# ---------------------------------------------------------------------------
+# 3.2 (P2-2) — "nasci em dd/mm/aaaa" (data completa) calcula idade exata;
+# só o ano segue como antes, mas loga warning de ±1 na fronteira 75/76.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_idade_data_completa_calcula_idade_exata_respeitando_mes_dia():
+    hoje = date.today()
+    nascimento = date(1990, 12, 31)  # dia/mês tipicamente ainda não chegado no ano
+    esperado = hoje.year - nascimento.year
+    if (hoje.month, hoje.day) < (nascimento.month, nascimento.day):
+        esperado -= 1
+
+    assert normalize_idade("nasci em 31/12/1990") == esperado
+
+
+def test_normalize_idade_data_completa_aniversario_ja_passado_no_ano():
+    hoje = date.today()
+    nascimento = date(1990, 1, 1)  # dia/mês certamente já passou (exceto em 1º/jan)
+    esperado = hoje.year - nascimento.year
+    if (hoje.month, hoje.day) < (nascimento.month, nascimento.day):
+        esperado -= 1
+
+    assert normalize_idade("nasci em 01/01/1990") == esperado
+
+
+def test_normalize_idade_data_completa_invalida_cai_no_fallback_de_ano():
+    # "31/02" não existe -- não deve derrubar a extração, só ignora o
+    # dia/mês inválidos e segue o comportamento de só-ano.
+    ano_atual = date.today().year
+    esperado = ano_atual - 1990
+
+    assert normalize_idade("nasci em 31/02/1990") == esperado
+
+
+def test_normalize_idade_so_ano_perto_da_fronteira_75_76_loga_warning(caplog):
+    ano_boundary = date.today().year - 75
+
+    with caplog.at_level(logging.WARNING):
+        idade = normalize_idade(f"nasci em {ano_boundary}")
+
+    assert idade == 75
+    assert any("75" in rec.message and "76" in rec.message for rec in caplog.records)
+
+
+def test_normalize_idade_so_ano_longe_da_fronteira_nao_loga_warning(caplog):
+    ano_longe = date.today().year - 30
+
+    with caplog.at_level(logging.WARNING):
+        idade = normalize_idade(f"nasci em {ano_longe}")
+
+    assert idade == 30
+    assert caplog.records == []
 
 
 def test_extract_once_normaliza_nasci_em_do_texto_quando_llm_devolve_frase():

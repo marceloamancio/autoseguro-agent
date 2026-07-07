@@ -21,10 +21,13 @@ falta dado essencial.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 # Faixas válidas — espelham exatamente o schema da /quote
 # (`namastex-fde-challenge/quote-service/app/main.py`, `QuoteRequest`).
@@ -64,7 +67,19 @@ _PIVOT_2_DIGIT_ANO = 68  # ano corrente % 100 seria mais "correto", mas um pivô
 _REGEX_ANO = re.compile(r"\b(19\d{2}|20\d{2})\b")
 _REGEX_CEP_COM_HIFEN = re.compile(r"\b\d{5}-\d{3}\b")
 _REGEX_CEP_8_DIGITOS = re.compile(r"\b\d{8}\b")
+# 3.2 (P2-2): data completa de nascimento ("nasci em dd/mm/aaaa") -- checada
+# antes de `_REGEX_NASCI_EM` (só ano) pra calcular a idade exata respeitando
+# mês/dia, em vez do erro sistemático de ±1 que o cálculo só-por-ano produz
+# (grave justo na fronteira 75/76 de recusa).
+_REGEX_NASCI_EM_DATA_COMPLETA = re.compile(
+    r"nasci\w*\s+em\s+(\d{2})/(\d{2})/(\d{4})", re.IGNORECASE
+)
 _REGEX_NASCI_EM = re.compile(r"nasci\w*\s+em\s+(\d{4})", re.IGNORECASE)
+
+# Idades onde o erro de ±1 do cálculo só-por-ano é mais grave: cruzam a
+# fronteira de recusa 75/76 (ver `namastex-fde-challenge` `plans.json`/regra
+# de negócio) -- só nesses valores vale logar o warning (não pra toda idade).
+_IDADE_BOUNDARY_WARNING_VALUES = frozenset({75, 76})
 _REGEX_DIGITS_ONLY = re.compile(r"\D+")
 _REGEX_DATA_BR = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 
@@ -146,10 +161,19 @@ def normalize_cep(raw: str | int | None) -> str | None:
     """Normaliza um CEP com ou sem hífen para o formato `XXXXX-XXX`.
 
     Retorna `None` quando o valor não tem exatamente 8 dígitos (CEP inválido).
+
+    `int` (3.1 / P2-1): zero-pad para 8 dígitos (`f"{raw:08d}"`) antes de
+    seguir o fluxo normal -- um CEP de alto risco começando com "0" (ex.:
+    07654-321, região de São Paulo) chega do LLM/backstop como `int` sem o
+    zero à esquerda (`7654321`); convertê-lo direto pra string perderia esse
+    zero e o CEP viraria "faltante" (8 dígitos exigidos) sem nenhum aviso.
     """
     if raw is None:
         return None
-    text = str(raw).strip()
+    if isinstance(raw, int):
+        text = f"{raw:08d}"
+    else:
+        text = str(raw).strip()
     if _REGEX_CEP_COM_HIFEN.fullmatch(text):
         return text
     digits = _REGEX_DIGITS_ONLY.sub("", text)
@@ -158,12 +182,46 @@ def normalize_cep(raw: str | int | None) -> str | None:
     return f"{digits[:5]}-{digits[5:]}"
 
 
+def _age_from_birthdate(birth: date, today: date) -> int:
+    """Idade exata em `today`, respeitando se o aniversário do ano já passou."""
+    age = today.year - birth.year
+    if (today.month, today.day) < (birth.month, birth.day):
+        age -= 1
+    return age
+
+
+def _idade_so_por_ano(birth_year: int) -> int:
+    """Cálculo aproximado de sempre (`date.today().year - birth_year`), com
+    warning (3.2 / P2-2) quando o resultado cai na fronteira 75/76."""
+    idade = date.today().year - birth_year
+    if idade in _IDADE_BOUNDARY_WARNING_VALUES:
+        logger.warning(
+            "normalize_idade: idade %s calculada só a partir do ano de "
+            "nascimento (%s), sem mês/dia -- erro de ±1 possível bem na "
+            "fronteira 75/76 de recusa por idade",
+            idade,
+            birth_year,
+        )
+    return idade
+
+
 def normalize_idade(raw: int | str | None) -> int | None:
     """Normaliza idade a partir de um inteiro, string numérica ou frase.
 
-    Reconhece o padrão "nasci em AAAA" e converte pra idade coerente com o ano
-    corrente (`date.today().year - AAAA`). Não valida faixa aqui — ver
-    `extract_once`.
+    Reconhece dois padrões (3.2 / P2-2):
+
+    - **Data completa** ("nasci em dd/mm/aaaa"): calcula a idade **exata**,
+      respeitando se o aniversário deste ano já passou (`_age_from_birthdate`)
+      -- corrige o erro sistemático de ±1 do cálculo só-por-ano. Data
+      inexistente (ex.: "31/02/1990") não derruba a extração: cai no
+      fallback abaixo (só ano).
+    - **Só o ano** ("nasci em aaaa"): segue o cálculo aproximado de sempre
+      (`date.today().year - aaaa`), mas **loga um warning** quando a idade
+      resultante cai na fronteira 75/76 (`_IDADE_BOUNDARY_WARNING_VALUES`) --
+      é justo aí que o erro de ±1 pode empurrar o lead pro lado errado da
+      regra de recusa por idade.
+
+    Não valida faixa aqui — ver `extract_once`.
     """
     if raw is None:
         return None
@@ -171,10 +229,21 @@ def normalize_idade(raw: int | str | None) -> int | None:
         return raw
 
     text = str(raw).strip()
+
+    full_date_match = _REGEX_NASCI_EM_DATA_COMPLETA.search(text)
+    if full_date_match:
+        dd, mm, yyyy = (int(g) for g in full_date_match.groups())
+        try:
+            birth = date(yyyy, mm, dd)
+        except ValueError:
+            # Data inexistente (ex.: 31/02) -- não derruba a extração, cai no
+            # fallback de só-ano (mesmo warning de fronteira se aplicável).
+            return _idade_so_por_ano(yyyy)
+        return _age_from_birthdate(birth, date.today())
+
     match = _REGEX_NASCI_EM.search(text)
     if match:
-        birth_year = int(match.group(1))
-        return date.today().year - birth_year
+        return _idade_so_por_ano(int(match.group(1)))
 
     try:
         return int(text)

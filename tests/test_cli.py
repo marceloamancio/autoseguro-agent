@@ -289,6 +289,62 @@ def test_parse_media_marker(raw, expected_text, expected_media_type):
 
 
 # ---------------------------------------------------------------------------
+# 2.4 (P1-1) — log entregue/curado: varredura LLM em lote, fora do hot-path
+# ---------------------------------------------------------------------------
+
+
+def test_cure_delivered_log_calls_sweep_once_in_batch_and_masks_beyond_regex():
+    calls = []
+
+    def fake_sweep(texts, categories):
+        calls.append((list(texts), list(categories)))
+        return [t.replace("Fulano de Tal", "⟨NOME_TERCEIRO⟩") for t in texts]
+
+    events = [
+        {
+            "type": "message.in",
+            "message_body": "cpf 389.083.863-43, e Fulano de Tal confirma",
+        },
+        {"type": "message.out", "message_body": "sem nenhuma pii aqui"},
+    ]
+
+    cured = cli.cure_delivered_log(events, llm_client=fake_sweep)
+
+    assert len(calls) == 1  # uma única chamada em lote pro log inteiro
+    assert "⟨CPF⟩" in cured[0]["message_body"]
+    assert "⟨NOME_TERCEIRO⟩" in cured[0]["message_body"]
+    assert cured[1]["message_body"] == "sem nenhuma pii aqui"
+    # não muta os eventos originais
+    assert events[0]["message_body"] == "cpf 389.083.863-43, e Fulano de Tal confirma"
+
+
+def test_cure_delivered_log_sem_llm_client_aplica_so_o_regex():
+    events = [{"type": "message.in", "message_body": "cpf 389.083.863-43"}]
+
+    cured = cli.cure_delivered_log(events)
+
+    assert cured[0]["message_body"] == "cpf ⟨CPF⟩"
+
+
+def test_cure_delivered_log_ignora_campos_de_texto_nao_configurados():
+    events = [{"message_body": "cpf 389.083.863-43", "sender_name": "Fulano de Tal"}]
+
+    cured = cli.cure_delivered_log(events, text_fields=("message_body",))
+
+    assert cured[0]["sender_name"] == "Fulano de Tal"
+
+
+def test_write_jsonl_grava_um_evento_por_linha(tmp_path):
+    events = [{"a": 1}, {"b": 2}]
+    path = tmp_path / "delivered.jsonl"
+
+    cli.write_jsonl(path, events)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == events
+
+
+# ---------------------------------------------------------------------------
 # Fail-fast de chave (separado dos demais — sem monkeypatch de env fake)
 # ---------------------------------------------------------------------------
 

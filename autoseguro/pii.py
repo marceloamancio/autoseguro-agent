@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 # ---------------------------------------------------------------------------
 # Camada 1 — regex simples e certeiro
@@ -54,6 +54,50 @@ PLACA_RE = re.compile(r"\b[A-Za-z]{3}\d[A-Za-z]\d{2}\b")
 # CEP: 5 dígitos + hífen + 3 dígitos.
 CEP_RE = re.compile(r"\b\d{5}-\d{3}\b")
 
+# ---------------------------------------------------------------------------
+# 2.4 (P1-1) — ampliação de recall: formatos plausíveis e comuns em chat real
+# que o regex calibrado (acima) contra o formato exato do gerador não pega.
+# Este módulo é **at-rest** (Q3) — over-masking é aceitável, então o viés
+# aqui é deliberadamente pra **recall**, não precisão: preferimos mascarar um
+# número comum demais a deixar PII real vazar em claro no log entregue.
+# ---------------------------------------------------------------------------
+
+# Telefone móvel cru (sem nenhuma formatação): DDD (2 dígitos) + "9" do nono
+# dígito + 8 dígitos = 11 dígitos corridos, ex. "11912345678".
+#
+# Ambiguidade documentada: um CPF cru (11 dígitos, ver `CPF_CRU_RE` abaixo)
+# cujo 3º dígito por acaso seja "9" também bate neste padrão e sai mascarado
+# como TELEFONE em vez de CPF. Aceitável: at-rest, over-masking é o viés
+# desejado — o que importa é que a PII (seja qual for a categoria) não
+# vaza, não que o marcador acerte a categoria exata. Este regex roda antes
+# de `CPF_CRU_RE` na ordem de aplicação, então qualquer sequência de 11
+# dígitos com "9" na 3ª posição é sempre atribuída a TELEFONE primeiro.
+TELEFONE_CRU_RE = re.compile(r"\b\d{2}9\d{8}\b")
+
+# Telefone móvel com DDD entre parênteses (com/sem espaço) e hífen antes dos
+# últimos 4 dígitos: "(11) 91234-5678".
+TELEFONE_PARENTESES_RE = re.compile(r"\(\d{2}\)\s*9\d{4}-\d{4}")
+
+# Telefone fixo: 4 dígitos + hífen + 4 dígitos, sem o "9" inicial do celular
+# (com ou sem DDD entre parênteses antes — o parêntese em si não precisa
+# fazer parte do match, só os 8 dígitos com hífen já bastam pra mascarar).
+TELEFONE_FIXO_RE = re.compile(r"\b\d{4}-\d{4}\b")
+
+# CPF cru (11 dígitos sem pontuação nenhuma), ex. "12345678901". Roda depois
+# dos padrões de telefone acima (ver ambiguidade documentada em
+# `TELEFONE_CRU_RE`) — só sobra pra CPF o que não tiver a marca do "9" na 3ª
+# posição nem já foi consumido por um formato de telefone.
+CPF_CRU_RE = re.compile(r"\b\d{11}\b")
+
+# Placa antiga (pré-Mercosul): 3 letras + 4 dígitos, sem separador, ex.
+# "ABC1234" — ainda circulando aos milhões. Não se sobrepõe ao padrão
+# Mercosul (`PLACA_RE`, que exige uma letra na 5ª posição): aqui as 4
+# posições finais são todas dígitos.
+PLACA_ANTIGA_RE = re.compile(r"\b[A-Za-z]{3}\d{4}\b")
+
+# CEP colado, sem hífen: 8 dígitos direto, ex. "01310100".
+CEP_CRU_RE = re.compile(r"\b\d{8}\b")
+
 MARKERS = {
     "cpf": "⟨CPF⟩",
     "email": "⟨EMAIL⟩",
@@ -66,12 +110,23 @@ MARKERS = {
 # se sobrepõem (dígitos com pontuação distinta vs. letras+dígitos), mas a
 # ordem deixa explícito que os formatos "mais específicos" (com prefixo/
 # pontuação characteristic, como +55 ou pontos de CPF) são checados primeiro.
+#
+# Os formatos "de recall" (2.4 / P1-1) vêm depois dos formatos exatos do
+# gerador, e entre si na ordem: variantes de telefone antes de `CPF_CRU_RE`
+# (mesmo comprimento, 11 dígitos — ver ambiguidade documentada acima do
+# `TELEFONE_CRU_RE`), e placa/CEP crus por último (não competem com nada).
 _REGEX_MARKER_ORDER: tuple[tuple[re.Pattern[str], str], ...] = (
     (CPF_RE, MARKERS["cpf"]),
     (TELEFONE_RE, MARKERS["telefone"]),
     (EMAIL_RE, MARKERS["email"]),
     (PLACA_RE, MARKERS["placa"]),
     (CEP_RE, MARKERS["cep"]),
+    (TELEFONE_CRU_RE, MARKERS["telefone"]),
+    (TELEFONE_PARENTESES_RE, MARKERS["telefone"]),
+    (TELEFONE_FIXO_RE, MARKERS["telefone"]),
+    (CPF_CRU_RE, MARKERS["cpf"]),
+    (PLACA_ANTIGA_RE, MARKERS["placa"]),
+    (CEP_CRU_RE, MARKERS["cep"]),
 )
 
 
@@ -219,3 +274,75 @@ class PiiRedactor:
         """
         pre_masked = [redact_text(t) for t in texts]
         return llm_sweep(pre_masked, client=self.llm_client, categories=self.categories)
+
+
+# ---------------------------------------------------------------------------
+# Adaptador real da varredura LLM (2.4 / P1-1) — SDK Anthropic, lazy import
+# ---------------------------------------------------------------------------
+
+# Uma linha por texto, numerada como `build_sweep_prompt` apresenta o lote de
+# entrada (ex.: "1. texto mascarado") — é o formato que pedimos de volta pra
+# conseguir realinhar a resposta com o lote original.
+_NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)\.\s?(.*)$")
+
+
+def _parse_swept_response(raw_text: str, expected_count: int) -> Optional[list[str]]:
+    """Recompõe a resposta numerada da varredura de volta numa lista alinhada.
+
+    Devolve `None` (nunca levanta) quando a resposta não numerou exatamente
+    `expected_count` linhas — resposta em formato inesperado é tratada como
+    "a varredura não ajudou", não como erro fatal; quem chama decide o
+    fallback (`AnthropicSweepClient.__call__` devolve os textos originais).
+    """
+    parsed: dict[int, str] = {}
+    for line in raw_text.splitlines():
+        match = _NUMBERED_LINE_RE.match(line)
+        if match:
+            parsed[int(match.group(1))] = match.group(2)
+    if len(parsed) != expected_count:
+        return None
+    return [parsed[i] for i in range(1, expected_count + 1)]
+
+
+class AnthropicSweepClient:
+    """`LlmSweepClient` real: adaptador fino sobre `build_sweep_prompt` +
+    o SDK da Anthropic.
+
+    Implementa o contrato de `LlmSweepClient` (`__call__(texts, categories)
+    -> texts_mascarados`) — plugável direto em `PiiRedactor(llm_client=...)`.
+    Monta o prompt com `build_sweep_prompt` (já existente), chama a API
+    **uma única vez em lote** e realinha a resposta numerada de volta à lista
+    de entrada.
+
+    Import do SDK é **lazy** (dentro do `__init__`, só quando `client` não é
+    injetado) — mesmo padrão de `anthropic_extractor.AnthropicExtractor`.
+    Nunca instanciado nos testes: eles injetam um `client` fake (dublê de
+    `client.messages.create`) e nunca tocam a rede.
+    """
+
+    def __init__(self, api_key: str, model: str, *, client: Any | None = None) -> None:
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
+        self._client = client
+        self._model = model
+
+    def __call__(self, texts: Sequence[str], categories: Sequence[str]) -> list[str]:
+        """Varre `texts` em uma única chamada; fallback pros textos originais
+        se a resposta não vier no formato numerado esperado (nunca perde
+        texto, nunca propaga erro de parsing pro caller)."""
+        if not texts:
+            return list(texts)
+
+        prompt = build_sweep_prompt(texts, categories)
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw_text = "".join(
+            getattr(block, "text", "") for block in getattr(response, "content", [])
+        )
+        parsed = _parse_swept_response(raw_text, len(texts))
+        return parsed if parsed is not None else list(texts)
