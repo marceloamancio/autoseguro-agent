@@ -66,6 +66,12 @@ def build_agent_from_config(
         from .anthropic_extractor import AnthropicExtractor
 
         extractor = AnthropicExtractor(config.anthropic_api_key, config.anthropic_model)
+    if fuzzy_classifier is None:
+        # Classificador fuzzy determinístico (fora de escopo / reclamação) — sem
+        # ele, esses reason codes de handoff nunca disparam na CLI real.
+        from .handoff import KeywordFuzzyClassifier
+
+        fuzzy_classifier = KeywordFuzzyClassifier()
     quote_client = QuoteClient(config)
     session = QualificationSession()
     return Agent(

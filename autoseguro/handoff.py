@@ -311,6 +311,41 @@ def classify_fuzzy(text: str, classifier: FuzzyClassifier | None) -> HandoffDeci
     return _FUZZY_BUILDERS[reason](text)
 
 
+class KeywordFuzzyClassifier:
+    """`FuzzyClassifier` determinístico por palavras-chave (sem LLM).
+
+    Cobre os casos claros de **fora de escopo** (sinistro/boleto/cancelamento/
+    outros produtos) e **reclamação/conflito** de forma auditável e sem custo de
+    token. Conservador de propósito: em caso de dúvida retorna `None` e a mensagem
+    segue no fluxo normal de qualificação. `CONTRADICTORY_DATA` não é inferido por
+    keyword (depende de inconsistência de dados, não de vocabulário).
+    """
+
+    _OUT_OF_SCOPE = (
+        "sinistro", "boleto", "segunda via", "2a via", "2ª via", "cancelar seguro",
+        "cancelar apólice", "cancelar apolice", "cancelamento", "seguro residencial",
+        "seguro de vida", "seguro viagem", "reembolso", "cobrança", "cobranca",
+    )
+    _COMPLAINT = (
+        "reclamação", "reclamacao", "reclamar", "procon", "processar", "advogado",
+        "jurídico", "juridico", "processo", "absurdo", "ridículo", "ridiculo",
+        "péssimo", "pessimo", "vergonha", "descaso",
+    )
+
+    def classify(self, text: str) -> "HandoffReason | None":
+        low = text.lower()
+        # Reclamação tem prioridade: "quero cancelar, isso é um absurdo" → conflito.
+        if any(k in low for k in self._COMPLAINT):
+            return HandoffReason.COMPLAINT_CONFLICT
+        if any(k in low for k in self._OUT_OF_SCOPE):
+            return HandoffReason.OUT_OF_SCOPE
+        # Cancelamento de apólice/seguro existente (fora do escopo de vendas),
+        # tolerante a palavras no meio ("cancelar MEU seguro").
+        if "cancel" in low and any(w in low for w in ("seguro", "apólice", "apolice", "plano")):
+            return HandoffReason.OUT_OF_SCOPE
+        return None
+
+
 # ---------------------------------------------------------------------------
 # "Não transbordam" — o agente resolve sozinho (Q6). Mantidas como funções
 # explícitas só para documentar/testar a fronteira: sempre retornam `None`.

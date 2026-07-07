@@ -64,7 +64,7 @@ Digite as mensagens como se fosse o lead; o agente responde no terminal. `sair` 
 uv run pytest
 ```
 
-Todos os 128 testes rodam **sem chave e sem rede** — LLM e `QuoteClient` são sempre
+Todos os 136 testes rodam **sem chave e sem rede** — LLM e `QuoteClient` são sempre
 dublês/mocks nos testes (ver `Protocol`s injetáveis em `agent.py`/`extraction.py`/
 `quote_client.py`).
 
@@ -281,7 +281,7 @@ autoseguro/
   tracing.py        # trace.jsonl (Group F, Q7)
   cli.py            # CLI REPL turn-based (Group F, Q4)
   replay.py         # harness opcional sobre o dataset (Group G — ver abaixo)
-tests/              # 128 testes, todos sem chave/rede (LLM e /quote mockados)
+tests/              # 136 testes, todos sem chave/rede (LLM e /quote mockados)
 ```
 
 ---
