@@ -12,10 +12,11 @@ e legíveis"). O LLM (`AsyncAnthropic`-like, injetado e mockável) entra só ond
 foi entregue/recusada (nunca na formatação do preço, que é sempre construída
 a partir da resposta real da `/quote`).
 
-- `call_quote` é o método que corresponde à tool única exposta ao domínio
-  (`CALL_QUOTE_TOOL_SCHEMA` documenta o schema que seria registrado como tool
-  da Anthropic numa integração completa de tool-use); aqui é invocado pelo
-  fluxo determinístico assim que a qualificação é confirmada.
+- `call_quote` é o **único** ponto de entrada do domínio para a `/quote`,
+  invocado pelo fluxo determinístico assim que a qualificação é confirmada.
+  Deliberadamente NÃO é registrado como tool do LLM: o LLM não tem acesso ao
+  caminho que produz preço — é essa fronteira, garantida por arquitetura e
+  não por prompt, que sustenta o "nunca inventa preço".
 - Extração/qualificação delega a `QualificationSession` (Group D) — o agente
   só pluga um `extractor` (mesmo Protocol `LlmExtractorClient` de
   `extraction.py`) e trata os sinais de completude/handoff que ela expõe.
@@ -88,33 +89,6 @@ FIELD_QUESTIONS: dict[str, str] = {
     "idade": "sua idade",
     "veiculo_ano": "o ano do seu veículo",
     "cep": "o CEP onde o carro fica",
-}
-
-# Schema documentado da tool única exposta ao domínio (DEC-1). Numa
-# integração completa de tool-use da Anthropic, seria passado em
-# `messages.create(tools=[CALL_QUOTE_TOOL_SCHEMA])`. Aqui o fluxo
-# determinístico chama `Agent.call_quote` diretamente (ver docstring do
-# módulo).
-CALL_QUOTE_TOOL_SCHEMA: dict[str, Any] = {
-    "name": "call_quote",
-    "description": (
-        "Cota um seguro de veículo a partir do plano, idade, ano do "
-        "veículo, CEP e data de início da vigência."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "plano_id": {
-                "type": "string",
-                "enum": ["essencial", "completo", "premium"],
-            },
-            "idade": {"type": "integer", "minimum": 0, "maximum": 200},
-            "veiculo_ano": {"type": "integer", "minimum": 1950, "maximum": 2100},
-            "cep": {"type": "string"},
-            "data_inicio": {"type": "string", "description": "YYYY-MM-DD"},
-        },
-        "required": ["plano_id", "idade", "veiculo_ano"],
-    },
 }
 
 SYSTEM_PROMPT = """\
@@ -559,7 +533,7 @@ class Agent:
         return AgentTurn(reply=explanation, quote=quote)
 
     async def call_quote(self, payload: dict[str, Any]) -> QuoteResult:
-        """A tool única do domínio (`CALL_QUOTE_TOOL_SCHEMA`): cota via `QuoteClient`.
+        """Único ponto de entrada do domínio para a `/quote`: cota via `QuoteClient`.
 
         Nunca inventa preço — propaga `CotacaoRecusada`/`PayloadInvalido`/
         `QuoteUnavailable` do `quote_client` (Group B) pro chamador decidir.

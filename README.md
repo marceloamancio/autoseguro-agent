@@ -112,8 +112,8 @@ dentro do repo — nada fica "em aberto" fora daqui.
 
 ### Runtime do agente: SDK da Anthropic direto, sem framework (Q1)
 
-Agente enxuto, direto no **SDK da Anthropic** (`AsyncAnthropic`), com a `/quote` exposta como
-**tool única** do domínio (`agent.CALL_QUOTE_TOOL_SCHEMA`). Alternativas descartadas:
+Agente enxuto, direto no **SDK da Anthropic** (`AsyncAnthropic`), com a `/quote` atrás de um
+**único ponto de entrada** do domínio (`agent.Agent.call_quote`). Alternativas descartadas:
 `automagik-hive` (esconde a resiliência que a avaliação quer ver, adiciona dependência),
 Pydantic AI / LangGraph (dependência de terceiro, overkill pra um fluxo linear de
 qualificação→cotação). Menos dependências = menos risco de setup na hora de rodar, e a
@@ -143,6 +143,11 @@ O LLM **nunca decide sozinho** quais tools chamar, se cota, ou se transborda. Po
   formata texto a partir de dados que o Python já validou.
 - Existe sim um **loop de conversa** turno a turno (`Agent.handle_turn`), mas ele é dirigido
   pelas mensagens do lead, não por um LLM decidindo o próximo passo.
+- **Migrar pra tool-use é barato quando fizer sentido**: `Agent.call_quote` já tem a
+  assinatura de uma tool (payload tipado, erros de negócio propagados) — registrá-la em
+  `messages.create(tools=[...])` é mudança localizada. A escolha aqui foi deliberada: num
+  domínio onde o output é um **preço**, a fronteira "LLM nunca alcança o caminho do preço"
+  vale mais do que a autonomia de um loop.
 
 ### Modelo: `claude-sonnet-5` (Q2)
 

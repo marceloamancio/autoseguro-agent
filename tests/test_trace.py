@@ -103,16 +103,3 @@ def test_trace_masks_pii_in_message_body_before_writing_to_disk(tmp_path):
     assert "123.456.789-00" not in raw_disk
     assert "lead@example.com" not in raw_disk
 
-
-def test_curated_path_receives_the_same_masked_events(tmp_path):
-    trace_path = tmp_path / "trace.jsonl"
-    curated_path = tmp_path / "curated.jsonl"
-    tracer = Tracer(path=trace_path, curated_path=curated_path)
-
-    tracer.message_in("cpf 123.456.789-00")
-    tracer.close()
-
-    raw_events = _read_events(trace_path)
-    curated_events = _read_events(curated_path)
-    assert raw_events == curated_events
-    assert "123.456.789-00" not in curated_path.read_text(encoding="utf-8")

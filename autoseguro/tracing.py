@@ -22,9 +22,10 @@ antes de ser gravado — nunca grava PII em claro em disco. A implementação é
 `logging` stdlib + um formatter JSON (`_JsonLineFormatter`), sem dependência
 extra.
 
-`curated_path` (opcional) recebe uma cópia dos mesmos eventos mascarados —
-é a API que o Group G usa para produzir os logs de execução entregues
-(happy-path e falha→handoff), sem precisar reprocessar `logs/trace.jsonl`.
+Os logs de execução **entregues** (happy-path e falha→handoff) não saem
+daqui: são produzidos em lote por `cli.cure_delivered_log` a partir de
+`Tracer.events`, porque a varredura LLM de PII (camada 2) roda fora do
+hot-path — ver `cli.py`.
 """
 
 from __future__ import annotations
@@ -98,7 +99,6 @@ class Tracer:
     run_id: str = field(default_factory=new_id)
     conversation_id: str = field(default_factory=new_id)
     path: Path = field(default_factory=lambda: DEFAULT_LOG_DIR / DEFAULT_TRACE_FILENAME)
-    curated_path: Path | None = None
     redactor: PiiRedactor = field(default_factory=PiiRedactor)
     text_fields: tuple[str, ...] = DEFAULT_TEXT_FIELDS
 
@@ -106,12 +106,6 @@ class Tracer:
         self.path = Path(self.path)
         base_name = f"autoseguro.trace.{id(self)}"
         self._logger = _build_file_logger(base_name, self.path)
-        self._curated_logger: logging.Logger | None = None
-        if self.curated_path is not None:
-            self.curated_path = Path(self.curated_path)
-            self._curated_logger = _build_file_logger(
-                f"{base_name}.curated", self.curated_path
-            )
         self.events: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -130,8 +124,6 @@ class Tracer:
 
         self.events.append(masked)
         self._logger.info(masked)
-        if self._curated_logger is not None:
-            self._curated_logger.info(masked)
         return masked
 
     # ------------------------------------------------------------------
@@ -187,10 +179,7 @@ class Tracer:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Fecha os `FileHandler`s — libera os arquivos (útil em testes)."""
-        for logger in (self._logger, self._curated_logger):
-            if logger is None:
-                continue
-            for handler in list(logger.handlers):
-                handler.close()
-                logger.removeHandler(handler)
+        """Fecha o `FileHandler` — libera o arquivo (útil em testes)."""
+        for handler in list(self._logger.handlers):
+            handler.close()
+            self._logger.removeHandler(handler)
