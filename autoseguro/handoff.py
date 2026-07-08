@@ -118,7 +118,9 @@ def for_agent_error(exc: Exception) -> HandoffDecision:
     )
 
 
-_MEDIA_TYPES_UNREADABLE = frozenset({"image", "audio", "document"})
+# "video" não aparece no dataset do desafio, mas a CLI aceita o marcador
+# `[video]` — precisa transbordar igual às demais mídias sem transcrição.
+_MEDIA_TYPES_UNREADABLE = frozenset({"image", "audio", "document", "video"})
 
 
 def for_media_unreadable(media_type: str) -> HandoffDecision:

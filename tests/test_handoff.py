@@ -77,7 +77,7 @@ def test_agent_error_triggers_agent_error_reason():
     assert "algo quebrou" in decision.context["error"]
 
 
-@pytest.mark.parametrize("media_type", ["image", "audio", "document"])
+@pytest.mark.parametrize("media_type", ["image", "audio", "document", "video"])
 def test_media_essential_types_trigger_media_unreadable(media_type):
     assert is_media_essential(media_type) is True
 
