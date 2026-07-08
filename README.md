@@ -73,7 +73,7 @@ Digite as mensagens como se fosse o lead; o agente responde no terminal. `sair` 
 uv run pytest
 ```
 
-Todos os 136 testes rodam **sem chave e sem rede** — LLM e `QuoteClient` são sempre
+Todos os 233 testes rodam **sem chave e sem rede** — LLM e `QuoteClient` são sempre
 dublês/mocks nos testes (ver `Protocol`s injetáveis em `agent.py`/`extraction.py`/
 `quote_client.py`).
 
@@ -183,13 +183,16 @@ CPF, e-mail, telefone ou placa — a `/quote` não usa nenhum desses campos. Se 
 espontaneamente, o dado é mascarado at-rest e simplesmente não entra no fluxo de cotação.
 
 **Extração e qualificação** (Q3b, `extraction.py`): do veículo, só o **ano** importa pra
-cotar (marca/modelo servem só pra rapport). Extração via LLM com structured outputs
-(`{veiculo_ano, idade, cep, marca?, modelo?, data_inicio?}`), com **confirmação obrigatória**
-do lead antes de cotar ("Corolla 2008, você 35 anos, CEP 01310-100 — confere?"), normalização
-(ano 2 vs 4 dígitos, CEP com/sem hífen, "nasci em X" → idade) e validação contra as faixas
-reais da `/quote` (`idade` 0–200, `veiculo_ano` 1950–2100). Um **backstop regex leve** cobre
-ano/CEP quando o LLM não está disponível ou falha. Faltando dado essencial após **N=2**
-tentativas → sinal de handoff (`CLARIFY_LOOP_EXHAUSTED`).
+cotar (marca/modelo servem só pra rapport). **Extração 100% via LLM** com structured outputs
+(`{veiculo_ano, idade, cep, marca?, modelo?, data_inicio?}`): **nenhum regex garimpa a
+mensagem crua**. Regex de extração quebra no adversarial — um backstop chegou a pescar "2080"
+de dentro de um telefone (`+55 62 95496-2080`) e cotar o carro errado; removê-lo subiu a
+acurácia do ano de 95% para 100% (ver `eval/`). Em Python fica só **normalização de formato**
+do valor que o LLM devolveu (ano 2→4 dígitos, CEP com/sem hífen → `XXXXX-XXX`, data → ISO) e
+**validação de faixa** contra a `/quote` (`idade` 0–200, `veiculo_ano` 1950–2100). A defesa
+contra alucinação do LLM é a **confirmação obrigatória** do lead antes de cotar ("Corolla 2008,
+você 35 anos, CEP 01310-100 — confere?"), não um segundo extrator. Faltando dado essencial
+após **N=2** tentativas → sinal de handoff (`CLARIFY_LOOP_EXHAUSTED`).
 
 ### Resiliência da `/quote`: infra × negócio, timeout 9s, retry, breaker, nunca inventar preço (Q5)
 
@@ -311,13 +314,14 @@ autoseguro/
   config.py        # env + fail-fast (Group A)
   quote_client.py   # cliente resiliente da /quote (Group B, Q5)
   pii.py            # mascaramento at-rest + minimização (Group C, Q3)
-  extraction.py     # extração/qualificação via LLM + backstop (Group D, Q3b)
+  extraction.py     # extração/qualificação 100% via LLM (Group D, Q3b)
   agent.py          # loop do agente, tool call_quote, explicação da cotação (Group E, Q1)
   handoff.py        # motor de handoff com reason_code (Group E, Q6)
   tracing.py        # trace.jsonl (Group F, Q7)
   cli.py            # CLI REPL turn-based (Group F, Q4)
   replay.py         # harness opcional sobre o dataset (Group G — ver abaixo)
-tests/              # 136 testes, todos sem chave/rede (LLM e /quote mockados)
+tests/              # 233 testes, todos sem chave/rede (LLM e /quote mockados)
+eval/               # harness de avaliação sobre o dataset (acurácia + custo; ver eval/README.md)
 ```
 
 ---
