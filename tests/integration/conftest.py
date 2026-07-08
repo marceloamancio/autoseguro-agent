@@ -9,7 +9,17 @@ enforcement de timeout do httpcore).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+# Mesmo caminho calculado em `fake_quote.py` — o fake reusa a lógica de
+# negócio real do desafio, que vive num repo irmão (ver README, "repo irmão").
+# Não dá pra importar de `fake_quote` pra checar: o import é justamente o que
+# quebra sem o repo presente.
+_CHALLENGE_QUOTE_SERVICE = (
+    Path(__file__).resolve().parents[3] / "namastex-fde-challenge" / "quote-service"
+)
 
 
 @pytest.fixture(scope="module")
@@ -18,6 +28,11 @@ def fake_quote_server():
     teste — cada módulo sobe sua própria instância numa porta livre e a
     derruba ao final.
     """
+    if not _CHALLENGE_QUOTE_SERVICE.is_dir():
+        pytest.skip(
+            "requer o repo namastex-fde-challenge clonado como irmão deste "
+            f"(esperado em {_CHALLENGE_QUOTE_SERVICE}) — ver README"
+        )
     from fake_quote import FakeQuoteServer
 
     server = FakeQuoteServer()

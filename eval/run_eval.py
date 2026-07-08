@@ -54,7 +54,12 @@ def _default_dataset() -> Path:
     env = os.getenv("NAMA_DATASET")
     if env:
         return Path(env)
-    return Path.home() / "Desktop/nama_novo/namastex-fde-challenge/dataset/conversations.parquet"
+    # Convenção do projeto: `namastex-fde-challenge` clonado como repo irmão
+    # deste (mesma convenção do Makefile e de `autoseguro/replay.py`).
+    return (
+        Path(__file__).resolve().parents[2]
+        / "namastex-fde-challenge/dataset/conversations.parquet"
+    )
 
 
 def truth_ano(veiculo_texto: str | None) -> int | None:

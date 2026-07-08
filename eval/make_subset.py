@@ -17,10 +17,23 @@ full. Uso:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from pathlib import Path
 
 import pandas as pd
+
+
+def _default_dataset() -> Path:
+    env = os.getenv("NAMA_DATASET")
+    if env:
+        return Path(env)
+    # Convenção do projeto: `namastex-fde-challenge` clonado como repo irmão
+    # deste (mesma convenção do Makefile e de `autoseguro/replay.py`).
+    return (
+        Path(__file__).resolve().parents[2]
+        / "namastex-fde-challenge/dataset/conversations.parquet"
+    )
 
 _PHONE = re.compile(r"\+?55|\d{4,5}-?\d{4}")
 
@@ -63,12 +76,16 @@ def stratified_sample(df: pd.DataFrame, n: int, seed: int = 42) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dataset", type=Path,
-                    default=Path.home() / "Desktop/nama_novo/namastex-fde-challenge/dataset/conversations.parquet")
+    ap.add_argument("--dataset", type=Path, default=_default_dataset())
     ap.add_argument("--n", type=int, default=150)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+
+    if not args.dataset.exists():
+        raise SystemExit(
+            f"dataset não encontrado: {args.dataset} (use --dataset ou $NAMA_DATASET)"
+        )
 
     df = pd.read_parquet(args.dataset)
     sample = stratified_sample(df, args.n, args.seed)
