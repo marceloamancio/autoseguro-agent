@@ -99,6 +99,11 @@ def test_text_message_is_not_media_essential():
         "como eu pago o boleto?",
         "quero contratar esse plano",
         "qual a forma de pagamento?",
+        # Regressão (execução ao vivo): o lead dizia isso, o handoff não
+        # disparava e o LLM prometia um encaminhamento que nunca acontecia.
+        "Na verdade mudei de ideia, quero fechar agora",
+        "vamos fechar então",
+        "queria assinar hoje ainda",
     ],
 )
 def test_policy_issuance_keywords_trigger_handoff(text):
@@ -108,8 +113,17 @@ def test_policy_issuance_keywords_trigger_handoff(text):
     assert decision.reason == HandoffReason.POLICY_ISSUANCE
 
 
-def test_regular_quote_question_does_not_trigger_policy_issuance():
-    assert for_policy_issuance("quanto fica o seguro do meu carro?") is None
+@pytest.mark.parametrize(
+    "text",
+    [
+        "quanto fica o seguro do meu carro?",
+        # `fechar`/`assinar` soltos não são pedido de emissão.
+        "dá pra fechar a janela do carro pelo app?",
+        "qual o processo pra contratar?",
+    ],
+)
+def test_regular_quote_question_does_not_trigger_policy_issuance(text):
+    assert for_policy_issuance(text) is None
 
 
 @pytest.mark.parametrize(
@@ -337,3 +351,15 @@ def test_classify_scope_assunto_genuinamente_alheio_ainda_transborda(text):
 
     assert decision is not None
     assert decision.reason == HandoffReason.OUT_OF_SCOPE
+
+
+def test_for_extractor_unavailable_is_agent_error_with_component():
+    """LLM fora do ar → `agent_error` + `component`, nunca `clarify_loop_exhausted`."""
+    from autoseguro.handoff import for_extractor_unavailable
+
+    decision = for_extractor_unavailable(RuntimeError("credit balance is too low"))
+
+    assert decision.reason == HandoffReason.AGENT_ERROR
+    assert decision.context["component"] == "extractor"
+    assert "instabilidade" in decision.message.lower()
+    assert "R$" not in decision.message

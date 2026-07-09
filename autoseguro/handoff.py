@@ -11,6 +11,7 @@ Tabela de gatilhos (Q6):
 | Caso                                                        | Perna              | Reason                    |
 |--------------------------------------------------------------|---------------------|---------------------------|
 | `/quote` esgotou os retries                                   | Capacidade (infra)  | `QUOTE_UNAVAILABLE`       |
+| LLM de extração fora do ar (`component: extractor`)           | Capacidade (infra)  | `AGENT_ERROR`             |
 | Erro inesperado no agente                                      | Capacidade (fail-safe) | `AGENT_ERROR`          |
 | Mídia essencial (áudio/imagem/doc sem transcrição)             | Capacidade          | `MEDIA_UNREADABLE`        |
 | Fechamento/emissão de apólice                                  | Capacidade          | `POLICY_ISSUANCE`         |
@@ -118,6 +119,30 @@ def for_agent_error(exc: Exception) -> HandoffDecision:
     )
 
 
+def for_extractor_unavailable(exc: Exception) -> HandoffDecision:
+    """LLM de extração fora do ar (Capacidade — infra, igual à `/quote`).
+
+    Simétrico a `for_quote_unavailable`: o LLM é infraestrutura tanto quanto o
+    `quote-service`, e sua queda não é culpa do lead. Sem isso, o agente
+    seguia pedindo os dados e acabava em `clarify_loop_exhausted` ("não
+    consegui reunir os dados") **depois de interrogar o lead duas vezes** —
+    um `reason_code` falso, que apontava pro lead um problema nosso.
+
+    Reusa `AGENT_ERROR` (fail-safe de capacidade) em vez de criar um motivo
+    novo; o `component` no contexto diz **qual** peça caiu, mantendo o
+    `reason_code` estável pra quem consome o trace.
+    """
+    return HandoffDecision(
+        reason=HandoffReason.AGENT_ERROR,
+        message=(
+            "Estou com uma instabilidade no meu sistema e não consigo "
+            "processar sua mensagem agora. Vou te encaminhar para um "
+            "consultor humano continuar o atendimento."
+        ),
+        context={"component": "extractor", "error": repr(exc)},
+    )
+
+
 # "video" não aparece no dataset do desafio, mas a CLI aceita o marcador
 # `[video]` — precisa transbordar igual às demais mídias sem transcrição.
 _MEDIA_TYPES_UNREADABLE = frozenset({"image", "audio", "document", "video"})
@@ -145,9 +170,15 @@ def is_media_essential(media_type: str | None) -> bool:
     return media_type in _MEDIA_TYPES_UNREADABLE
 
 
+# Ancorado em verbo+intenção, nunca num `fechar`/`assinar` solto: "fechar a
+# janela do carro" ou "assinar embaixo" não são pedido de emissão. `quero
+# fechar agora` (sem complemento) era o buraco -- o lead dizia isso, o handoff
+# não disparava e o LLM prometia um encaminhamento que nunca acontecia.
 _POLICY_ISSUANCE_RE = re.compile(
     r"emitir\s+a?\s*ap[oó]lice"
     r"|fechar\s+(o\s+)?(contrato|seguro|neg[oó]cio)"
+    r"|(quero|queria|vamos|podemos|posso)\s+fechar"
+    r"|(quero|queria|vamos|podemos)\s+assinar"
     r"|quero\s+contratar"
     r"|gerar\s+(o\s+)?boleto"
     r"|forma\s+de\s+pagamento"
@@ -459,7 +490,9 @@ def resolve_plan_not_in_catalog(plano_mencionado: str) -> None:
     """Plano fora do catálogo (`essencial`/`completo`/`premium`).
 
     O agente informa os 3 planos disponíveis e segue a conversa. NUNCA gera
-    handoff.
+    handoff. A implementação vive em `agent.detect_unknown_plano` +
+    `agent.format_plano_catalog`; esta função existe só pra documentar/testar
+    a fronteira ("não transborda") junto das demais `resolve_*`.
     """
     return None
 
