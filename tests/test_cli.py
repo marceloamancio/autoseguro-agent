@@ -359,3 +359,26 @@ def test_main_fails_fast_without_api_key_and_never_prints_key(monkeypatch, capsy
     captured = capsys.readouterr()
     assert "ANTHROPIC_API_KEY" in captured.err
     assert "sk-ant" not in captured.err.lower()
+
+
+def test_cure_delivered_log_falls_back_to_regex_when_sweep_raises():
+    """A varredura LLM caindo não pode derrubar o log entregue.
+
+    Regressão real: sem crédito na API, a CLI morria com traceback DEPOIS da
+    conversa (o `trace.jsonl` já estava salvo) e o `delivered.jsonl` nunca era
+    gerado. A camada 2 (recall) é opcional; a camada 1 (regex) é a garantia.
+    """
+
+    def _raising_sweep(texts, categories):
+        raise RuntimeError("credit balance is too low")
+
+    events = [{"type": "message.in", "message_body": "meu cpf é 123.456.789-01"}]
+
+    with pytest.raises(RuntimeError):
+        cli.cure_delivered_log(events, llm_client=_raising_sweep)
+
+    # O fallback (regex puro) mascara e nunca levanta -- é o caminho que
+    # `main()` toma quando a varredura falha.
+    cured = cli.cure_delivered_log(events, llm_client=None)
+    assert "123.456.789-01" not in cured[0]["message_body"]
+    assert "⟨CPF⟩" in cured[0]["message_body"]

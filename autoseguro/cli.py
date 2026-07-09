@@ -219,10 +219,16 @@ def _log_quote_outcome(tracer: Tracer, turn: Any) -> None:
     `agent.format_refusal`).
     """
     if turn.quote is not None:
+        # Os 3 valores monetários da resposta 200 vão pro trace, não só o
+        # prêmio: é o que torna auditável (e verificável por máquina) a
+        # invariante "todo R$ mostrado ao lead veio de uma cotação real".
+        pro_rata = turn.quote.primeiro_pagamento_pro_rata or {}
         tracer.quote_result(
             status="success",
             plano_id=turn.quote.plano_id,
             premio_mensal=turn.quote.premio_mensal,
+            franquia=turn.quote.franquia,
+            valor_primeiro_pagamento=pro_rata.get("valor_primeiro_pagamento"),
         )
     elif turn.handoff is not None and turn.handoff.reason == HandoffReason.QUOTE_UNAVAILABLE:
         tracer.quote_result(
@@ -273,7 +279,11 @@ async def run_repl(
             media_type=media_type,
         )
 
-        tracer.message_out(turn.reply)
+        # `llm_reply_blocked` só entra no evento quando o guard disparou --
+        # um preço fabricado descartado é exatamente o tipo de coisa que
+        # precisa estar no trace (Q7), não só nos testes.
+        extra = {"llm_reply_blocked": True} if turn.llm_reply_blocked else {}
+        tracer.message_out(turn.reply, **extra)
         _log_quote_outcome(tracer, turn)
 
         if turn.handoff is not None:
@@ -306,8 +316,23 @@ def main() -> None:
     # `build_agent_from_config`/`AnthropicExtractor`).
     from .pii import AnthropicSweepClient
 
-    sweep_client = AnthropicSweepClient(config.anthropic_api_key, config.anthropic_model)
-    delivered = cure_delivered_log(tracer.events, llm_client=sweep_client)
+    # A varredura LLM é a camada 2 (recall), não a garantia: a camada 1
+    # (regex) já rodou por evento no `trace.jsonl`. Se a rede/API falhar aqui,
+    # o log entregue NÃO pode sumir nem derrubar o processo -- a conversa já
+    # acabou. Cai pro regex puro (idempotente) e avisa em stderr.
+    try:
+        sweep_client: LlmSweepClient | None = AnthropicSweepClient(
+            config.anthropic_api_key, config.anthropic_model
+        )
+        delivered = cure_delivered_log(tracer.events, llm_client=sweep_client)
+    except Exception as exc:  # noqa: BLE001 -- degradar, nunca quebrar no shutdown
+        print(
+            f"Aviso: varredura LLM de PII indisponível ({exc.__class__.__name__}); "
+            f"o log entregue usa apenas o mascaramento por regex.",
+            file=sys.stderr,
+        )
+        delivered = cure_delivered_log(tracer.events, llm_client=None)
+
     write_jsonl(tracer.path.parent / DELIVERED_LOG_FILENAME, delivered)
 
 
