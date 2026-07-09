@@ -121,6 +121,12 @@ class ExtractionResult:
     llm_used: bool
     llm_raw: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # O extractor existia mas LEVANTOU (LLM fora do ar, sem crédito, 5xx) --
+    # distinto de "sem client" e de "o lead não informou nada". Sem esse
+    # sinal, uma queda da API vira `clarify_loop_exhausted`, culpando o lead
+    # por uma falha de infra nossa (ver `agent._handle_turn`).
+    extractor_failed: bool = False
+    extractor_error: Exception | None = None
     # 2.2 (P1-4): só é preenchido por `QualificationSession.process_turn`
     # (compara contra o dado essencial já acumulado na sessão) -- sempre
     # `False` num `extract_once` isolado, que não tem histórico pra comparar.
@@ -238,9 +244,18 @@ def _is_contradictory(field_name: str, old_value: Any, new_value: Any) -> bool:
     """Sobrescrita materialmente diferente de um essencial (2.2 / P1-4).
 
     Conservador de propósito: `None` (primeiro turno) ou valor igual nunca é
-    contradição -- só correções grosseiras dos 3 essenciais: `idade`
-    Δ>15, `veiculo_ano` Δ>10, `cep` com prefixo (2 díg) diferente. Correção
-    pequena/plausível (ex.: 35 -> 40) não passa desses limiares.
+    contradição -- só correções grosseiras de `idade` (Δ>15) e `veiculo_ano`
+    (Δ>10). Correção pequena/plausível (ex.: 35 -> 40) não passa desses
+    limiares.
+
+    **`cep` deliberadamente NÃO é contradição** (achado da bateria
+    adversarial, `b14`). O prefixo de 2 dígitos do CEP é exatamente o que a
+    `/quote` usa pra decidir o agravo de região (`prefixos_alto_risco`) --
+    tratar prefixo diferente como fraude significava marcar como suspeita
+    justamente toda correção de CEP que muda o preço. Mudar de CEP é a
+    correção mais banal do domínio (mudança de endereço, carro que fica na
+    casa da mãe); a `/quote` só reprecifica. O turno cai em
+    `essential_changed` e o agente re-cota de verdade.
     """
     if old_value is None or new_value is None or old_value == new_value:
         return False
@@ -248,8 +263,6 @@ def _is_contradictory(field_name: str, old_value: Any, new_value: Any) -> bool:
         return abs(new_value - old_value) > _IDADE_CONTRADICTION_DELTA
     if field_name == "veiculo_ano":
         return abs(new_value - old_value) > _VEICULO_ANO_CONTRADICTION_DELTA
-    if field_name == "cep":
-        return str(old_value)[:2] != str(new_value)[:2]
     return False
 
 
@@ -275,20 +288,27 @@ def extract_once(
        e valida as faixas da `/quote`; valores fora da faixa viram `None` com
        um aviso em `warnings` (nunca derrubam a extração dos demais campos).
 
-    Sem `llm_client` (ou se ele levantar exceção) nada é extraído -- o caso de
-    LLM indisponível está fora do escopo do desafio; a robustez contra
-    alucinação vem da confirmação com o lead antes de cotar (Group E).
+    Sem `llm_client` nada é extraído. Se o client **levantar**, nada é
+    extraído e `extractor_failed=True` -- o LLM é infraestrutura tanto quanto
+    a `/quote`, então sua queda vira handoff `agent_error` imediato
+    (`agent._handle_turn`), nunca `clarify_loop_exhausted` culpando o lead.
+    A robustez contra alucinação vem da confirmação com o lead antes de
+    cotar (Group E).
     """
     raw: dict[str, Any] = {}
     llm_used = False
+    extractor_failed = False
+    extractor_error: Exception | None = None
 
     if llm_client is not None:
         try:
             raw = llm_client.extract(text) or {}
             llm_used = True
-        except Exception:
+        except Exception as exc:  # LLM indisponível -- sinaliza, não engole
             raw = {}
             llm_used = False
+            extractor_failed = True
+            extractor_error = exc
 
     warnings: list[str] = []
 
@@ -316,7 +336,14 @@ def extract_once(
         intent=normalize_intent(raw.get("intent")),
     )
 
-    return ExtractionResult(data=data, llm_used=llm_used, llm_raw=raw, warnings=warnings)
+    return ExtractionResult(
+        data=data,
+        llm_used=llm_used,
+        llm_raw=raw,
+        warnings=warnings,
+        extractor_failed=extractor_failed,
+        extractor_error=extractor_error,
+    )
 
 
 @dataclass

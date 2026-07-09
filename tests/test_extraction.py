@@ -554,7 +554,15 @@ def test_process_turn_does_not_flag_small_veiculo_ano_correction():
     assert result.contradiction is False
 
 
-def test_process_turn_flags_cep_prefix_contradiction():
+def test_process_turn_does_not_flag_cep_change_as_contradiction():
+    """Trocar de CEP — até de região — é correção legítima, nunca fraude.
+
+    Regressão de `b14` (bateria adversarial): o prefixo de 2 dígitos do CEP é
+    exatamente o que a `/quote` usa no agravo de risco, então marcá-lo como
+    contradição significava tratar como suspeita toda correção de CEP que
+    muda o preço. Agora o turno cai em `essential_changed` e o agente re-cota
+    de verdade (ver `test_cep_change_after_quote_triggers_real_requote`).
+    """
     session = QualificationSession()
     session.process_turn("cep 26703-384", llm_client=StubLlmClient({"cep": "26703-384"}))
 
@@ -562,7 +570,8 @@ def test_process_turn_flags_cep_prefix_contradiction():
         "na verdade é 01000-000", llm_client=StubLlmClient({"cep": "01000-000"})
     )
 
-    assert result.contradiction is True
+    assert result.contradiction is False
+    assert result.data.cep == "01000-000"
 
 
 def test_process_turn_no_contradiction_on_first_turn():
@@ -573,3 +582,30 @@ def test_process_turn_no_contradiction_on_first_turn():
     )
 
     assert result.contradiction is False
+
+
+def test_extract_once_signals_extractor_failure_instead_of_swallowing():
+    """Queda do LLM vira sinal (`extractor_failed`), não silêncio.
+
+    Sem esse flag, `{}` de "o lead não falou nada" e `{}` de "a API caiu" eram
+    indistinguíveis — e a queda virava `clarify_loop_exhausted`.
+    """
+
+    class _Raising:
+        def extract(self, text):
+            raise RuntimeError("boom")
+
+    result = extract_once("35 anos", llm_client=_Raising())
+
+    assert result.extractor_failed is True
+    assert isinstance(result.extractor_error, RuntimeError)
+    assert result.llm_used is False
+    assert result.data.idade is None
+
+
+def test_extract_once_without_client_is_not_a_failure():
+    result = extract_once("35 anos", llm_client=None)
+
+    assert result.extractor_failed is False
+    assert result.extractor_error is None
+    assert result.llm_used is False
