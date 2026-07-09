@@ -32,8 +32,9 @@ Trace estruturado bruto (mascarado): [`traces/execucao-happy.trace.jsonl`](trace
 >
 > **Lead:** valeu, obrigado!
 >
-> **Agente:** De nada! 😊 Se surgir qualquer dúvida sobre seguro de veículo ou quiser fazer
-> uma cotação, é só me chamar aqui.
+> **Agente:** Por nada! Se precisar confirmar mais alguma coisa sobre essa cotação, é só
+> chamar. O próximo passo (fechamento e emissão da apólice) fica com um consultor humano, que
+> vai te dar sequência. 🙂
 
 ## O que este log demonstra
 
@@ -44,6 +45,18 @@ Trace estruturado bruto (mascarado): [`traces/execucao-happy.trace.jsonl`](trace
 - **Regras específicas explicadas** a partir da resposta da `/quote`: **carência** de 30d
   (roubo/furto) e **pró-rata** do 1º pagamento — R$ 75.61 = `137.88 × 17/31` (a vigência
   começa em 15/08). Nada é inventado — o valor é repassado **fiel** à API.
-- **Rastreabilidade:** cada mensagem tem `event_id`; a cotação tem `quote_request_id` e
-  `status: success` no trace.
+- **Rastreabilidade:** cada mensagem tem `event_id`; a cotação tem `quote_request_id`,
+  `status: success` e **os três valores monetários** (`premio_mensal`, `franquia`,
+  `valor_primeiro_pagamento`) — é isso que torna verificável por máquina a invariante
+  "todo `R$` mostrado ao lead veio de uma cotação real":
+
+  ```json
+  {"type": "quote.result", "status": "success", "plano_id": "essencial",
+   "premio_mensal": 137.88, "franquia": 4500, "valor_primeiro_pagamento": 75.61,
+   "quote_request_id": "309e32b287f34eb0b385f650caf766bd"}
+  ```
+
 - **PII mascarada** no registro (`⟨CEP⟩`).
+- **A conversa livre não promete o que não pode cumprir:** no último turno o agente diz que o
+  fechamento "fica com um consultor humano" em vez de afirmar que já transferiu — o handoff é
+  decisão determinística do Python (`handoff.py`), nunca do LLM.

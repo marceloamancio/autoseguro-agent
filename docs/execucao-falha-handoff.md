@@ -28,11 +28,25 @@ Trace estruturado bruto (mascarado): [`traces/execucao-falha-handoff.trace.jsonl
 ## O que este log demonstra
 
 - **Resiliência:** o cliente da `/quote` fez **3 tentativas** (1 + 2 retries com backoff),
-  todas falharam — visível no trace: `"attempts": 3`,
-  `"reason": "esgotou_tentativas:http_503"`, `"status": "unavailable"`.
-- **Nunca inventa preço:** ao esgotar, o agente **não fabrica** uma cotação.
+  todas falharam — visível no trace:
+
+  ```json
+  {"type": "quote.result", "status": "unavailable", "attempts": 3,
+   "reason": "esgotou_tentativas:http_500",
+   "quote_request_id": "0b9f2e5a45284b9c9502d3cec03b6a0b"}
+  {"type": "handoff", "status": "handoff", "reason_code": "quote_unavailable"}
+  ```
+
+- **Nunca inventa preço:** ao esgotar, o agente **não fabrica** uma cotação. Note que o evento
+  `quote.result` de falha não carrega **nenhum** valor monetário — não há preço a registrar
+  porque nenhum existiu. (Num `success`, o mesmo evento traz `premio_mensal`, `franquia` e
+  `valor_primeiro_pagamento`.)
 - **Handoff explícito e defensável:** transborda com `reason_code: quote_unavailable`
   (fronteira de **capacidade** — infra fora do controle do agente), registrado no trace.
+- **Cada infra caída tem seu próprio motivo:** `/quote` fora → `quote_unavailable`; LLM de
+  extração fora → `agent_error` com `component: "extractor"`. Nunca
+  `clarify_loop_exhausted`, que significa "o lead não informou" e culparia o lead por uma
+  falha nossa.
 - **Mensagem honesta ao lead**, sem travar.
 - **Rastreabilidade:** `quote_request_id`, `attempts`, `reason`, `status` e `reason_code`
   do handoff, todos no trace com ids.
