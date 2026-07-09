@@ -30,7 +30,7 @@ a partir da resposta real da `/quote`).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Protocol
 
@@ -65,6 +65,25 @@ _INSTRUCTION_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_FREE_TEXT_FIELD_LEN = 30
+
+# Teto de mensagens (lead+agente) mantidas na íntegra em `AgentState.history`
+# -- só contexto pra conversa livre pós-cotação (`_llm_reply`). O que
+# transborda esse teto NÃO é descartado: vira uma linha condensada em
+# `AgentState.history_summary` (ver `_remember_turn`), então o contexto antigo
+# continua chegando ao LLM sem deixar o payload crescer sem limite.
+_MAX_HISTORY_MESSAGES = 20
+
+# Resumo das mensagens que saíram da janela: cada uma vira uma linha
+# `papel: texto truncado`. Condensação determinística de propósito -- sem
+# chamada extra de LLM (que custaria token e poderia alucinar num prompt que
+# fica ao lado dos fatos de preço); os fatos que realmente importam (a cotação
+# real) chegam estruturados via `last_quote` e nunca dependem deste resumo.
+#
+# 20 verbatim + 40 resumidas = ~60 mensagens (~30 turnos) de contexto retido.
+# Além disso as linhas mais antigas caem: perde-se texto de conversa, nunca o
+# estado que carrega decisão (`last_quote`, `session.data`, `plano_id`).
+_MAX_SUMMARY_LINES = 40
+_SUMMARY_LINE_MAX_CHARS = 120
 
 
 def _sanitize_free_text_field(value: str | None) -> str | None:
@@ -120,6 +139,87 @@ de venda de seguro de veículo, houver reclamação/conflito, ou for necessário
 fechar/emitir a apólice (você não tem essa ferramenta).\
 """
 
+# Prompt da conversa livre (pós-cotação/pós-recusa). Deliberadamente
+# diferente do `SYSTEM_PROMPT` de vendas: nesse ponto o LLM só redige texto —
+# não cota (o preço vem sempre de `_quote_and_reply`) e não transborda (o
+# handoff é decidido em `handoff.py`, antes daqui). Instruí-lo a prometer
+# qualquer uma das duas coisas produzia mentira: ele dizia "vou te encaminhar
+# pro consultor" sem que nenhum handoff fosse registrado.
+FREE_CHAT_SYSTEM_PROMPT = """\
+Você é um vendedor da AutoSeguro conversando por WhatsApp com um lead que já \
+passou pela etapa de cotação.
+
+O bloco "Fatos da cotação" abaixo é a SUA ÚNICA FONTE DE VERDADE. Ele vem \
+direto da API de cotação. Você não tem nenhuma outra informação sobre este \
+seguro, e seu conhecimento geral sobre seguros NÃO se aplica à AutoSeguro.
+
+Você só pode afirmar estes cinco itens, e apenas copiando o valor exato dos \
+fatos:
+1. o plano cotado;
+2. o prêmio mensal;
+3. a franquia;
+4. a lista de coberturas incluídas;
+5. a carência (dias e quais coberturas) e o primeiro pagamento pró-rata.
+
+É PROIBIDO afirmar qualquer coisa fora dessa lista. Em especial, nunca \
+afirme, estime, calcule ou dê a entender: outro valor em reais (mesmo \
+"aproximado", "a partir de" ou como exemplo); desconto, promoção ou margem \
+de negociação; cobertura que não esteja na lista de coberturas dos fatos; \
+carência, prazo ou data que não esteja nos fatos; forma de pagamento, \
+parcelamento, cartão ou boleto; duração da vigência, reajuste, renovação ou \
+cancelamento; regra de aceitação, exclusão ou franquia de outro plano.
+
+Nunca recalcule nem estime um preço por conta própria — nem para outro \
+plano, outra idade, outro veículo ou outro CEP. Você não faz contas: o preço \
+existe só quando a API o devolve.
+
+Se o lead perguntar qualquer coisa que não esteja nos fatos, responda \
+literalmente que você não tem essa informação e que um consultor humano vai \
+confirmar. Isso não é falha: é o comportamento correto. Preferir "não sei" a \
+um palpite é a regra mais importante deste prompt.
+
+Você NÃO consegue, por conta própria, recalcular a cotação, fechar negócio, \
+emitir apólice ou transferir o atendimento — então nunca prometa nenhuma \
+dessas ações. Se o lead pedir uma delas, apenas diga que é o próximo passo e \
+deixe que o sistema cuide do encaminhamento.
+
+Minimização de dados — nunca peça CPF, e-mail, telefone ou placa.\
+"""
+
+_NO_QUOTE_FACTS = "Nenhuma cotação foi calculada ainda nesta conversa."
+
+
+def build_quote_facts(quote: QuoteResult | None) -> str:
+    """Serializa a última cotação real como fatos pro prompt de papo livre.
+
+    Sem isso o LLM não sabe que já cotou e alucina ("ainda não fizemos uma
+    cotação") ou responde "não tenho essa informação" sobre uma cobertura que
+    está na resposta real da `/quote`.
+    """
+    if quote is None:
+        return (
+            "Fatos da cotação: " + _NO_QUOTE_FACTS + " Portanto NENHUM valor em "
+            "reais, cobertura, franquia ou prazo pode ser citado por você."
+        )
+    linhas = [
+        f"- Plano cotado: {quote.plano_nome} ({quote.plano_id})",
+        f"- Prêmio mensal: R$ {quote.premio_mensal:.2f}",
+        f"- Franquia: R$ {quote.franquia:.2f}",
+        f"- Coberturas incluídas: {', '.join(quote.coberturas)}",
+    ]
+    carencia = quote.carencia or {}
+    if carencia.get("dias") is not None:
+        coberturas = ", ".join(carencia.get("coberturas", []))
+        linhas.append(f"- Carência: {carencia['dias']} dias para {coberturas}")
+    pro_rata = quote.primeiro_pagamento_pro_rata or {}
+    valor = pro_rata.get("valor_primeiro_pagamento")
+    if valor is not None:
+        linhas.append(
+            f"- Primeiro pagamento (pró-rata): R$ {valor:.2f} "
+            f"({pro_rata.get('dias_cobrados')} de {pro_rata.get('dias_no_mes')} dias)"
+        )
+    return "Fatos da cotação já entregue (a única fonte de valores):\n" + "\n".join(linhas)
+
 
 class _MessagesApi(Protocol):
     async def create(self, **kwargs: Any) -> Any:
@@ -154,10 +254,23 @@ class AgentState:
     quote_delivered: bool = False
     handoff: HandoffDecision | None = None
     asked_data_inicio: bool = False
+    # Guarda anti-loop: o catálogo de planos é informado no máximo uma vez.
+    informed_catalog: bool = False
     # 1.2 (P0-1): último payload que a /quote recusou com 400 -- nunca
     # reenviado idêntico (ver `_quote_and_reply`).
     last_invalid_payload: dict[str, Any] | None = None
     last_invalid_detalhe: str | None = None
+    # Histórico turno a turno (lead/agente), usado só para dar contexto à
+    # conversa livre pós-cotação (`_llm_reply`) -- nunca lido pelo caminho
+    # determinístico de qualificação/cotação/handoff. Mantém as
+    # `_MAX_HISTORY_MESSAGES` mais recentes na íntegra; o que transborda vai
+    # condensado pra `history_summary` em vez de ser jogado fora.
+    history: list[dict[str, str]] = field(default_factory=list)
+    history_summary: list[str] = field(default_factory=list)
+    # Última cotação REAL entregue (resposta 200 da /quote). É a única fonte
+    # de valores monetários que a conversa livre pode citar -- ver
+    # `guard_no_fabricated_price`.
+    last_quote: QuoteResult | None = None
 
 
 @dataclass
@@ -168,12 +281,59 @@ class AgentTurn:
     handoff: HandoffDecision | None = None
     quote: QuoteResult | None = None
     closed: bool = False
+    # True quando o guard descartou a resposta do LLM por conter um valor
+    # monetário que não veio da `/quote` (auditável no trace, ver `cli.py`).
+    llm_reply_blocked: bool = False
+
+
+PLANOS_CATALOGO: tuple[str, ...] = ("essencial", "completo", "premium")
 
 
 def normalize_plano_mention(text: str) -> str | None:
     """Detecta menção a um dos 3 planos do catálogo no texto do lead."""
     match = re.search(r"\b(essencial|completo|premium)\b", text, re.IGNORECASE)
     return match.group(1).lower() if match else None
+
+
+# "plano ouro master", "plano gold", "plano top" -- nome de plano que o lead
+# inventa/lembra errado. Captura só as duas primeiras palavras depois de
+# "plano" (nomes reais são curtos) e ignora conectivos que indicam que a
+# palavra seguinte não é um nome ("plano de saúde" é outro assunto, tratado
+# por `classify_scope`).
+_PLANO_MENTION_RE = re.compile(
+    r"\bplano\s+((?!de\b|do\b|da\b|que\b|mais\b)[\wçãáéíóúâêô]+(?:\s+[\wçãáéíóúâêô]+)?)",
+    re.IGNORECASE,
+)
+
+
+def detect_unknown_plano(text: str) -> str | None:
+    """Nome de plano citado pelo lead que não existe no catálogo.
+
+    Devolve `None` quando o lead cita um plano válido (ou nenhum). Existe
+    porque `normalize_plano_mention` devolvendo `None` era indistinguível de
+    "não falou de plano": o `_quote_and_reply` caía no default `essencial` e
+    cotava **o plano mais barato em silêncio** para quem pediu "plano ouro
+    master" (achado `b24` da bateria adversarial).
+    """
+    if normalize_plano_mention(text) is not None:
+        return None
+    match = _PLANO_MENTION_RE.search(text)
+    if not match:
+        return None
+    return " ".join(match.group(1).split()).strip(" ,.!?")
+
+
+def format_plano_catalog(plano_mencionado: str) -> str:
+    """Informa que o plano citado não existe e lista os 3 do catálogo.
+
+    O agente resolve isso sozinho — nunca transborda (ver
+    `handoff.resolve_plan_not_in_catalog`).
+    """
+    return (
+        f"Não temos um plano chamado \"{plano_mencionado}\". Os planos "
+        f"disponíveis são: Essencial, Completo e Premium. Qual deles você "
+        f"quer que eu cote?"
+    )
 
 
 def build_missing_fields_question(missing: list[str], *, ask_data_inicio: bool) -> str:
@@ -285,6 +445,102 @@ def format_payload_invalido_repetido(detalhe: str | None) -> str:
     )
 
 
+_ROLE_LABELS = {"user": "lead", "assistant": "agente"}
+
+
+def _summarize_message(message: dict[str, str]) -> str:
+    """Condensa uma mensagem que saiu da janela numa linha `papel: texto`."""
+    role = _ROLE_LABELS.get(message.get("role", ""), message.get("role", "?"))
+    content = " ".join((message.get("content") or "").split())
+    if len(content) > _SUMMARY_LINE_MAX_CHARS:
+        content = content[: _SUMMARY_LINE_MAX_CHARS - 1].rstrip() + "…"
+    return f"{role}: {content}"
+
+
+# ---------------------------------------------------------------------------
+# Fronteira do preço: o LLM nunca emite um valor que não veio de um 200 da
+# `/quote`. Garantido aqui, deterministicamente -- não por instrução de prompt.
+# ---------------------------------------------------------------------------
+
+# Valor monetário prefixado por `R$`: aceita `137.88`, `219,40`, `3.200,00`,
+# `3000`. Só o que vem com `R$` é fiscalizado -- "30 dias" ou "17 de 31 dias"
+# passam livres.
+_MONEY_RE = re.compile(r"R\$\s*([\d.,]+)")
+
+
+def _money_to_cents(raw: str) -> int | None:
+    """Normaliza um literal monetário brasileiro/ASCII para centavos.
+
+    Trata o separador decimal como os 2 últimos dígitos quando precedidos de
+    `,` ou `.`; qualquer outro `.`/`,` é separador de milhar. Devolve `None`
+    quando o literal não é um número reconhecível.
+    """
+    cleaned = raw.strip().rstrip(".,")
+    if not cleaned or not any(ch.isdigit() for ch in cleaned):
+        return None
+    if len(cleaned) >= 3 and cleaned[-3] in ".," and cleaned[-2:].isdigit():
+        inteiro, centavos = cleaned[:-3], cleaned[-2:]
+    else:
+        inteiro, centavos = cleaned, "00"
+    digits = re.sub(r"\D", "", inteiro)
+    if not digits:
+        return None
+    return int(digits) * 100 + int(centavos)
+
+
+def extract_money_cents(text: str) -> set[int]:
+    """Todos os valores `R$` do texto, normalizados em centavos."""
+    found = (_money_to_cents(match) for match in _MONEY_RE.findall(text))
+    return {cents for cents in found if cents is not None}
+
+
+def allowed_money_cents(quote: QuoteResult | None) -> set[int]:
+    """Valores que o agente PODE citar: os da última cotação real.
+
+    Sem cotação entregue, o conjunto é vazio — nenhum valor monetário é
+    legítimo, porque nenhum preço real existe ainda.
+    """
+    if quote is None:
+        return set()
+    valores = [quote.premio_mensal, quote.franquia]
+    pro_rata = quote.primeiro_pagamento_pro_rata or {}
+    valor_primeiro = pro_rata.get("valor_primeiro_pagamento")
+    if valor_primeiro is not None:
+        valores.append(valor_primeiro)
+    return {round(float(v) * 100) for v in valores if v is not None}
+
+
+NO_QUOTE_YET_REPLY = (
+    "Ainda não tenho um valor calculado pra você — o preço só sai depois que "
+    "eu rodo a cotação no sistema. Quer que eu faça isso agora?"
+)
+
+
+def guard_no_fabricated_price(
+    reply: str, quote: QuoteResult | None
+) -> tuple[str, bool]:
+    """Descarta a resposta do LLM se ela citar um preço que a `/quote` não deu.
+
+    É esta função — e não o prompt — que sustenta o "nunca inventa preço" na
+    conversa livre. O LLM já não calcula o preço (`call_quote` nunca é
+    exposto como tool); aqui fechamos a outra metade da fronteira: ele também
+    não pode *escrever* um valor monetário que não venha de uma resposta 200
+    real. Ao detectar um valor fora do allow-list, a resposta inteira é
+    descartada em favor de um recap determinístico da cotação real (ou de um
+    aviso honesto, quando ainda não há cotação).
+
+    Devolve `(reply_segura, blocked)`.
+    """
+    citados = extract_money_cents(reply)
+    if not citados:
+        return reply, False
+    if citados <= allowed_money_cents(quote):
+        return reply, False
+    if quote is None:
+        return NO_QUOTE_YET_REPLY, True
+    return format_quote_explanation(quote), True
+
+
 def extract_reply_text(response: Any) -> str:
     """Extrai o texto de uma resposta do Messages API (ou de um dublê simples).
 
@@ -341,6 +597,41 @@ class Agent:
     async def handle_turn(
         self, user_msg: str, *, media_type: str | None = None
     ) -> AgentTurn:
+        """Processa mais um turno da conversa e registra no histórico.
+
+        Delega a `_handle_turn` para a lógica de decisão e só cuida de
+        acumular o histórico (lead/agente) ao final -- é ele que dá contexto
+        à conversa livre pós-cotação (`_llm_reply`); o caminho determinístico
+        de qualificação/cotação/handoff nunca o lê.
+        """
+        turn = await self._handle_turn(user_msg, media_type=media_type)
+        self._remember_turn(user_msg, turn.reply)
+        return turn
+
+    def _remember_turn(self, user_msg: str, reply: str) -> None:
+        """Anexa o turno ao histórico, condensando o que sair da janela.
+
+        As `_MAX_HISTORY_MESSAGES` mensagens mais recentes ficam na íntegra;
+        as que transbordam viram uma linha em `history_summary` (truncada,
+        determinística) -- assim uma conversa longa não perde o contexto
+        antigo, só a literalidade dele.
+        """
+        state = self.state
+        state.history.append({"role": "user", "content": user_msg})
+        state.history.append({"role": "assistant", "content": reply})
+
+        overflow = len(state.history) - _MAX_HISTORY_MESSAGES
+        if overflow <= 0:
+            return
+
+        dropped = state.history[:overflow]
+        del state.history[:overflow]
+        state.history_summary.extend(_summarize_message(m) for m in dropped)
+        del state.history_summary[: max(0, len(state.history_summary) - _MAX_SUMMARY_LINES)]
+
+    async def _handle_turn(
+        self, user_msg: str, *, media_type: str | None = None
+    ) -> AgentTurn:
         """Processa mais um turno da conversa e decide a próxima resposta.
 
         Ordem de avaliação (gatilhos determinísticos primeiro, Q6): handoff
@@ -374,6 +665,17 @@ class Agent:
         intent = result.data.intent
         essential_changed = _essential_snapshot(state.session.data) != before_essential
 
+        if result.extractor_failed:
+            # LLM de extração fora do ar: infra nossa, não culpa do lead.
+            # Escala IMEDIATAMENTE -- sem isso, a sessão acumulava turnos
+            # estagnados e acabava em `clarify_loop_exhausted`, pedindo duas
+            # vezes dados que o lead já tinha mandado.
+            decision = handoff.for_extractor_unavailable(
+                result.extractor_error or RuntimeError("extractor indisponível")
+            )
+            state.handoff = decision
+            return AgentTurn(reply=decision.message, handoff=decision)
+
         if result.contradiction:
             # 2.2 (P1-4): sobrescrita materialmente diferente de um
             # essencial (ex.: idade 35 -> 90) -- autoridade, não capacidade;
@@ -389,20 +691,39 @@ class Agent:
             state.handoff = decision
             return AgentTurn(reply=decision.message, handoff=decision)
 
+        before_plano = state.plano_id
         plano_mencionado = normalize_plano_mention(user_msg)
         if plano_mencionado is not None:
             state.plano_id = plano_mencionado
+        plano_changed = state.plano_id != before_plano
+
+        # Plano fora do catálogo: informa os 3 disponíveis em vez de cotar o
+        # `essencial` (default) calado. Resolve sozinho, nunca transborda
+        # (`handoff.resolve_plan_not_in_catalog`). Só quando o lead ainda não
+        # escolheu um plano válido -- "quero o completo, não o ouro" não deve
+        # parar o fluxo.
+        if state.plano_id is None and not state.informed_catalog:
+            desconhecido = detect_unknown_plano(user_msg)
+            if desconhecido is not None:
+                state.informed_catalog = True
+                return AgentTurn(reply=format_plano_catalog(desconhecido))
 
         if state.closed or state.quote_delivered:
-            if state.quote_delivered and (intent == "requote" or essential_changed):
-                # 1.3 (P0-3): re-cotar após entrega -- reabre a cotação com
-                # o dado novo em vez de engolir o pedido no papo livre.
+            if state.quote_delivered and (
+                intent == "requote" or essential_changed or plano_changed
+            ):
+                # 1.3 (P0-3): re-cotar após entrega -- reabre a cotação com o
+                # dado novo em vez de engolir o pedido no papo livre. Trocar de
+                # plano conta: sem isso, "e se eu escolher o completo?" caía no
+                # papo livre e o LLM inventava a cotação inteira (preço,
+                # franquia, coberturas) sem nunca chamar a `/quote`.
                 state.quote_delivered = False
                 state.confirmed = False
                 return await self._quote_and_reply()
-            reply = await self._llm_reply(user_msg)
+            reply, blocked = await self._llm_reply(user_msg)
             return AgentTurn(
-                reply=reply or "Fico à disposição se precisar de mais alguma coisa!"
+                reply=reply or "Fico à disposição se precisar de mais alguma coisa!",
+                llm_reply_blocked=blocked,
             )
 
         if state.awaiting_confirmation:
@@ -527,6 +848,7 @@ class Agent:
             return AgentTurn(reply=decision.message, handoff=decision)
 
         state.quote_delivered = True
+        state.last_quote = quote
         state.last_invalid_payload = None
         state.last_invalid_detalhe = None
         explanation = format_quote_explanation(quote, fallback_note=fallback_note)
@@ -540,17 +862,39 @@ class Agent:
         """
         return await self._quote_client.cotar(payload)
 
-    async def _llm_reply(self, user_msg: str) -> str:
+    def _build_free_chat_system(self) -> str:
+        """Prompt de papo livre + fatos da cotação real + resumo do que saiu
+        da janela de histórico."""
+        blocos = [FREE_CHAT_SYSTEM_PROMPT, build_quote_facts(self.state.last_quote)]
+        if self.state.history_summary:
+            blocos.append(
+                "Resumo do trecho mais antigo da conversa:\n"
+                + "\n".join(self.state.history_summary)
+            )
+        return "\n\n".join(blocos)
+
+    async def _llm_reply(self, user_msg: str) -> tuple[str, bool]:
         """Conversa livre (pós-cotação/pós-recusa) — única chamada real ao LLM.
 
         Nunca usado para decidir qualificação/confirmação/cotação/handoff
         (isso é sempre determinístico, ver docstring do módulo); serve só
         pra manter a conversa natural depois que o caminho já foi resolvido.
+
+        Manda o histórico acumulado (`state.history`, mais o resumo do que
+        transbordou) e os fatos da cotação real -- sem isso o LLM não sabe
+        que já cotou e alucina diante de uma objeção de preço. A saída passa
+        obrigatoriamente por `guard_no_fabricated_price`: o LLM pode redigir,
+        nunca precificar.
+
+        Devolve `(reply, blocked)`.
         """
+        messages = [*self.state.history, {"role": "user", "content": user_msg}]
         response = await self._llm.messages.create(
             model=self._model,
             max_tokens=400,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
+            system=self._build_free_chat_system(),
+            messages=messages,
         )
-        return extract_reply_text(response)
+        return guard_no_fabricated_price(
+            extract_reply_text(response), self.state.last_quote
+        )

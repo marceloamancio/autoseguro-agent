@@ -728,3 +728,313 @@ async def test_agent_confirmation_reply_never_echoes_raw_injection_in_marca():
     turn = await agent.handle_turn("Meu carro é esse aí, 2015, 35 anos, cep 01000-000")
 
     assert payload_marca not in turn.reply
+
+
+# ---------------------------------------------------------------------------
+# Fronteira do preço: o LLM redige, nunca precifica.
+#
+# Regressão de um bug real encontrado em execução ao vivo: o lead pedia outro
+# plano depois da cotação entregue, a troca caía no papo livre e o LLM
+# inventava a cotação inteira (preço, franquia, coberturas) sem nunca chamar
+# a `/quote` -- o trace registrava um único `quote.result`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_change_after_quote_triggers_real_requote():
+    essencial = make_quote(plano_id="essencial", plano_nome="Essencial", premio_mensal=137.88)
+    completo = make_quote(plano_id="completo", plano_nome="Completo", premio_mensal=241.38)
+    quote_client = StubQuoteClient(sequence=[essencial, completo])
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100, plano essencial")
+    await agent.handle_turn("sim, confere")
+    turn = await agent.handle_turn("e se eu escolher o plano completo, fica quanto?")
+
+    # A troca de plano foi cotada de verdade, não improvisada no papo livre.
+    assert len(quote_client.calls) == 2
+    assert quote_client.calls[1]["plano_id"] == "completo"
+    assert turn.quote is completo
+    assert "241.38" in turn.reply
+
+
+@pytest.mark.asyncio
+async def test_guard_blocks_fabricated_price_in_free_chat():
+    quote = make_quote(premio_mensal=137.88, franquia=4500.0)
+    quote_client = StubQuoteClient(result=quote)
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    session = QualificationSession()
+    llm = StubLlm("Consigo fazer por R$ 99,00/mês, um super desconto!")
+    agent = Agent(llm, quote_client, session, extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    turn = await agent.handle_turn("tem desconto?")
+
+    assert turn.llm_reply_blocked is True
+    assert "99,00" not in turn.reply
+    assert "137.88" in turn.reply  # recap determinístico da cotação real
+    assert len(quote_client.calls) == 1  # não recotou
+
+
+@pytest.mark.asyncio
+async def test_guard_allows_free_chat_quoting_the_real_values():
+    quote = make_quote(premio_mensal=137.88, franquia=4500.0)
+    quote_client = StubQuoteClient(result=quote)
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    session = QualificationSession()
+    llm = StubLlm("Como falei, sua mensalidade é R$ 137,88 e a franquia R$ 4.500,00.")
+    agent = Agent(llm, quote_client, session, extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    turn = await agent.handle_turn("me lembra o valor?")
+
+    assert turn.llm_reply_blocked is False
+    assert "137,88" in turn.reply
+
+
+@pytest.mark.asyncio
+async def test_guard_allows_free_chat_without_money_values():
+    quote_client = StubQuoteClient(result=make_quote())
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    session = QualificationSession()
+    llm = StubLlm("A carência é de 30 dias para roubo e furto, contados do início.")
+    agent = Agent(llm, quote_client, session, extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    turn = await agent.handle_turn("como funciona a carência?")
+
+    assert turn.llm_reply_blocked is False
+    assert "30 dias" in turn.reply
+
+
+@pytest.mark.asyncio
+async def test_free_chat_prompt_carries_history_and_real_quote_facts():
+    quote = make_quote(premio_mensal=137.88, coberturas=["colisao", "vidros"])
+    quote_client = StubQuoteClient(result=quote)
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    session = QualificationSession()
+    llm = StubLlm("Claro!")
+    agent = Agent(llm, quote_client, session, extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    await agent.handle_turn("cobre vidro quebrado?")
+
+    call = llm.messages.calls[-1]
+    # Os fatos da cotação real chegam ao LLM (senão ele responde "não tenho
+    # essa informação" sobre uma cobertura que está na resposta da /quote).
+    assert "137.88" in call["system"]
+    assert "vidros" in call["system"]
+    # E o histórico da conversa vai junto, não só a última mensagem.
+    assert len(call["messages"]) > 1
+    assert call["messages"][-1]["content"] == "cobre vidro quebrado?"
+
+
+def test_guard_helpers_normalize_brazilian_money_formats():
+    from autoseguro.agent import allowed_money_cents, extract_money_cents
+
+    assert extract_money_cents("R$ 137.88 e R$ 3.200,00") == {13788, 320000}
+    assert extract_money_cents("R$ 3000") == {300000}
+    assert extract_money_cents("carência de 30 dias") == set()
+
+    quote = make_quote(
+        premio_mensal=241.38,
+        franquia=3000.0,
+        primeiro_pagamento_pro_rata={"valor_primeiro_pagamento": 132.37},
+    )
+    assert allowed_money_cents(quote) == {24138, 300000, 13237}
+    assert allowed_money_cents(None) == set()
+
+
+@pytest.mark.asyncio
+async def test_history_caps_at_max_and_condenses_overflow_into_summary():
+    from autoseguro.agent import _MAX_HISTORY_MESSAGES
+
+    quote_client = StubQuoteClient(result=make_quote())
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    session = QualificationSession()
+    agent = Agent(StubLlm(), quote_client, session, extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    for i in range(_MAX_HISTORY_MESSAGES):
+        await agent.handle_turn(f"pergunta numero {i}")
+
+    assert len(agent.state.history) == _MAX_HISTORY_MESSAGES
+    # O que saiu da janela não é perdido: vira resumo pro prompt.
+    assert agent.state.history_summary
+    assert "lead: 35 anos" in agent.state.history_summary[0]
+    assert "Resumo do trecho mais antigo" in agent._build_free_chat_system()
+
+
+def test_free_chat_prompt_enumerates_what_may_not_be_invented():
+    """O prompt fecha explicitamente a lista de afirmações permitidas.
+
+    Defesa em profundidade, não a garantia: quem garante é
+    `guard_no_fabricated_price`. Este teste existe pra que uma reescrita do
+    prompt não apague as proibições sem alguém perceber -- cada item aqui
+    corresponde a uma alucinação observada em execução real (desconto,
+    parcelamento, "vigência de 12 meses", reajuste na renovação).
+    """
+    from autoseguro.agent import FREE_CHAT_SYSTEM_PROMPT
+
+    prompt = FREE_CHAT_SYSTEM_PROMPT.lower()
+    assert "única fonte de verdade" in prompt
+    for proibido in (
+        "desconto",
+        "cobertura que não esteja",
+        "forma de pagamento",
+        "parcelamento",
+        "reajuste",
+        "renovação",
+        "outro valor em reais",
+    ):
+        assert proibido in prompt, f"prompt deixou de proibir: {proibido}"
+    # Nunca recalcular por conta própria (o preço só existe vindo da API).
+    assert "nunca recalcule" in prompt
+    assert "não tem essa informação" in prompt
+
+
+def test_quote_facts_without_quote_forbids_any_value():
+    from autoseguro.agent import build_quote_facts
+
+    facts = build_quote_facts(None)
+    assert "nenhum valor em reais" in facts.lower()
+
+
+@pytest.mark.asyncio
+async def test_summary_caps_and_never_loses_decision_bearing_state():
+    """O resumo tem teto: texto antigo de conversa cai, estado nunca.
+
+    A garantia que importa não é "nada se perde" (o resumo satura em
+    `_MAX_SUMMARY_LINES`), e sim que o caminho determinístico nunca depende
+    do histórico: `last_quote` e os dados de qualificação sobrevivem a uma
+    conversa arbitrariamente longa.
+    """
+    from autoseguro.agent import _MAX_SUMMARY_LINES
+
+    quote = make_quote()
+    agent = Agent(
+        StubLlm(),
+        StubQuoteClient(result=quote),
+        QualificationSession(),
+        extractor=StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"}),
+    )
+    await agent.handle_turn("PRIMEIRA, 35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    for i in range(_MAX_SUMMARY_LINES * 2):
+        await agent.handle_turn(f"pergunta {i}")
+
+    assert len(agent.state.history_summary) == _MAX_SUMMARY_LINES
+    # A mensagem mais antiga já saiu até do resumo -- e tudo bem.
+    assert "PRIMEIRA" not in " ".join(agent.state.history_summary)
+    # O que carrega decisão sobrevive intacto.
+    assert agent.state.last_quote is quote
+    assert agent.state.session.data.idade == 35
+    assert agent.state.session.data.veiculo_ano == 2018
+
+
+# ---------------------------------------------------------------------------
+# Achados da bateria adversarial (30 conversas contra /quote e LLM reais).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cep_change_after_quote_triggers_real_requote():
+    """`b14`: corrigir o CEP re-cota de verdade, não acusa fraude.
+
+    O prefixo do CEP é o que a `/quote` usa pro agravo de região — a correção
+    que mais muda o preço era justamente a que virava `contradictory_data`.
+    """
+    baixo_risco = make_quote(plano_id="essencial", premio_mensal=137.88)
+    alto_risco = make_quote(plano_id="essencial", premio_mensal=179.24)
+    quote_client = StubQuoteClient(sequence=[baixo_risco, alto_risco])
+    extractor = StubExtractor(
+        responses=[
+            {"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"},
+            {"intent": "confirm"},
+            {"cep": "07100-000"},
+        ]
+    )
+    agent = Agent(StubLlm(), quote_client, QualificationSession(), extractor=extractor)
+
+    await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+    await agent.handle_turn("sim, confere")
+    turn = await agent.handle_turn("na verdade o carro fica no CEP 07100-000")
+
+    assert turn.handoff is None, "correção de CEP não pode virar handoff de fraude"
+    assert len(quote_client.calls) == 2
+    assert quote_client.calls[1]["cep"] == "07100-000"
+    assert turn.quote is alto_risco
+
+
+@pytest.mark.asyncio
+async def test_unknown_plan_informs_catalog_instead_of_quoting_essencial():
+    """`b24`: "plano ouro master" não pode virar cotação silenciosa do Essencial."""
+    quote_client = StubQuoteClient(result=make_quote())
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    agent = Agent(StubLlm(), quote_client, QualificationSession(), extractor=extractor)
+
+    turn = await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100, quero o plano ouro master")
+
+    assert turn.quote is None
+    assert quote_client.calls == [], "nunca cota um plano que o lead não escolheu"
+    assert "ouro master" in turn.reply
+    for plano in ("Essencial", "Completo", "Premium"):
+        assert plano in turn.reply
+    assert turn.handoff is None  # resolve sozinho
+
+
+@pytest.mark.asyncio
+async def test_known_plan_never_triggers_catalog_message():
+    quote_client = StubQuoteClient(result=make_quote())
+    extractor = StubExtractor({"idade": 35, "veiculo_ano": 2018, "cep": "01310-100"})
+    agent = Agent(StubLlm(), quote_client, QualificationSession(), extractor=extractor)
+
+    turn = await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100, quero o plano completo")
+
+    assert "não temos um plano" not in turn.reply.lower()
+    assert agent.state.plano_id == "completo"
+
+
+def test_detect_unknown_plano_ignores_valid_and_connectives():
+    from autoseguro.agent import detect_unknown_plano
+
+    assert detect_unknown_plano("quero o plano ouro master") == "ouro master"
+    assert detect_unknown_plano("plano gold por favor") == "gold por"
+    assert detect_unknown_plano("quero o plano premium") is None
+    assert detect_unknown_plano("qual o plano mais barato?") is None
+    assert detect_unknown_plano("sem menção nenhuma") is None
+
+
+class _RaisingExtractor:
+    """Dublê do extractor que simula o LLM fora do ar (sem crédito, 5xx)."""
+
+    def extract(self, text: str) -> dict:
+        raise RuntimeError("credit balance is too low")
+
+
+@pytest.mark.asyncio
+async def test_extractor_failure_escalates_immediately_as_agent_error():
+    """LLM caído é infra nossa: escala na hora, não culpa o lead.
+
+    Antes, `extract_once` engolia a exceção e o agente pedia os dados de novo,
+    acabando em `clarify_loop_exhausted` — um `reason_code` falso, que
+    apontava pro lead um problema de infraestrutura nosso.
+    """
+    quote_client = StubQuoteClient(result=make_quote())
+    agent = Agent(StubLlm(), quote_client, QualificationSession(), extractor=_RaisingExtractor())
+
+    turn = await agent.handle_turn("35 anos, Corolla 2018, cep 01310-100")
+
+    assert turn.handoff is not None
+    assert turn.handoff.reason == HandoffReason.AGENT_ERROR
+    assert turn.handoff.context["component"] == "extractor"
+    assert turn.handoff.reason != HandoffReason.CLARIFY_LOOP_EXHAUSTED
+    assert quote_client.calls == []
+    assert "R$" not in turn.reply
